@@ -2,7 +2,7 @@
 
 Date: 2026-11-02
 Author: Nemesis (with Claude Code)
-Status: Draft for approval
+Status: Draft for approval (hardened after three adversarial reviews)
 
 ## 1. Context and intent
 
@@ -14,17 +14,18 @@ LendLoop is a take-home assignment for a company that awards contract work. The 
 4. Integration design, reliability, and error handling (n8n)
 5. Documentation and reasoning
 
-The brief already fixes the stack and most of the feature surface. The real work is making judgment visible: an app that works, a security model that is enforced on the server, an n8n integration that survives failure, and documentation that explains why, not just how.
+The brief fixes the stack and most of the feature surface. The real work is making judgment visible: an app that works, a security model enforced on the server, an n8n integration that survives failure, and documentation that explains why, not just how.
 
-Success means a reviewer can open the repo and see a senior engineer's decisions in the code, the workflow JSON, and the README. The app does not need more features than the brief asks for.
+Success means a reviewer can open the repo, run it with their own free Clerk and Convex accounts, and see a senior engineer's decisions in the code, the workflow JSON, and the README. The app does not need more features than the brief asks for.
 
 ### Anti-goals
 
 - Feature creep beyond the brief.
-- UI-only authorization or role checks that a client can bypass.
+- UI-only authorization or role checks a client can bypass.
 - Secrets or literal webhook URLs committed to the repo or exported workflow JSON.
 - A "happy path only" n8n integration with no retries, no idempotency, and no visible failures.
 - Clever abstraction for its own sake. Prefer the simplest code that is still industry-standard.
+- Silent failure. Every background failure must surface in the admin automation view.
 
 ## 2. Fixed constraints from the brief
 
@@ -33,61 +34,69 @@ Success means a reviewer can open the repo and see a senior engineer's decisions
 - Authenticated listing CRUD, borrow requests, approve/decline, mark returned.
 - Filters by category, plus "My listings", "My requests", "Incoming requests" views.
 - Two roles, `admin` and `user`, enforced in Convex functions.
-- At least two n8n workflows: request notification webhook, daily overdue reminders.
-- HMAC-signed payloads in both directions, secrets in environment variables and n8n credentials only.
+- At least two n8n workflows: request notification webhook and daily overdue reminders.
+- HMAC-signed webhook payloads in both directions (Convex to n8n and n8n to Convex), with signatures verified on the receiving side. Secrets live in environment variables and n8n credentials only.
 - Idempotent write-backs, retries, and a visible error workflow.
-- Exported n8n workflow JSON, docker-compose for local n8n, README, production note.
+- Exported n8n workflow JSON, docker-compose for local n8n, README, and a short production note.
 - Bonus: recent automation activity shown per loan.
+
+Response signing is addressed in 9.2. The overdue response carries data, so it is signed. The request acknowledgement carries no data, so it is not. This satisfies "webhook payloads in both directions" without signing an empty ack.
 
 ## 3. Decisions made with Nemesis
 
 | Decision | Choice | Why |
 |---|---|---|
-| Submission window | 24 hours | Scope must be cut to the brief plus the bonus, with tests on the security-critical paths only. |
+| Submission window | 24 hours | Scope is cut to the brief plus the bonus, with tests on the security-critical paths. |
 | Notification channel | Logged mock, written back into Convex and shown in the app | No external accounts, no deliverability debugging, and the write-back doubles as the bonus automation timeline. |
-| Local run | Cloud Clerk and Convex keys plus Docker Compose for app, n8n, Postgres, and a cloudflared tunnel | Clerk and Convex are hosted services. Self-hosted Convex is fragile and would consume the time budget. |
+| Local run | Cloud Clerk and Convex keys plus Docker Compose for app, n8n, Postgres, a path-filtering proxy, and a cloudflared tunnel | Clerk and Convex are hosted services. Self-hosted Convex is fragile and would consume the time budget. |
+| Delivery | Public GitHub repo under `Noor-e-Bilal`, no live deployment | Confirmed with Nemesis. The 24 hours go into the app, a verified local stack, screenshots, and documentation instead of deployment risk. |
 | Repository | Public GitHub repo named `lendloop` | Brief deliverable. No secrets in the repo. |
-| UI implementation | `/ui-ux-pro-max` for the design pass plus 21st.dev registry/MCP for selected components, adapted to the project's tokens | Nemesis asked for this explicitly. Components are copied in and owned by the repo, not pulled in as a large runtime dependency. |
+| UI implementation | `/ui-ux-pro-max` for the design pass plus 21st.dev registry for selected components, copied into the repo and adapted to project tokens | Nemesis asked for this. Components are committed with their dependencies; the reviewer never needs 21st.dev access. |
 | Code complexity | Simplest code that is still industry-standard | Every non-obvious decision must be explainable in the README. |
-| Reviewer experience | Seed data adopts the admin's email on first sign-in | Reviewers will run the repo themselves. A reviewer who signs in as themselves must see incoming requests, an overdue loan, and an automation timeline without creating a second account. |
-| Delivery | Repository only, no live deployment | Confirmed with Nemesis. The 24 hours go into the app, the verified local stack, screenshots, and documentation instead of deployment risk. |
-| Accounts | GitHub under `Noor-e-Bilal`, Convex CLI logged in, Clerk keys supplied locally, 21st.dev connected | Confirmed with Nemesis. The admin email is configured in Convex environment only and never committed. |
-| Timezone | One board timezone from `BOARD_TIMEZONE`, with a one-day grace on request start dates | Avoids rejecting a date the user just picked from a date picker while keeping overdue logic deterministic. |
-| Response signing | Only request payloads are HMAC-signed. Responses are TLS-protected and unsigned | The brief asks for signed payloads in both directions. Signing a response to a request the receiver initiated adds verification cost without a meaningful threat reduction. |
-| Audit scope | Audit writes only, never reads | Convex queries cannot write. Firing a mutation on page load to record a read is a write-on-read smell that adds noise without improving security. |
+| Reviewer experience | Seed data adopts the reviewer's own admin email on first sign-in, and `npm run seed` is re-runnable after `ADMIN_EMAILS` changes | A reviewer who signs in as themselves must see incoming requests, an overdue loan, and an automation timeline without creating a second account. |
+| Identity claims | Clerk `convex` JWT template explicitly includes `email`, `email_verified`, and `name`; verified email is required | Clerk's default token omits these claims. Admin promotion and seed adoption are privilege operations and must require proof of email ownership. |
+| Timezone | One board date derived from `BOARD_UTC_OFFSET_MINUTES` (default `0`), with a one-day grace on request start dates | Avoids the unverified `Intl` dependency in the Convex runtime and keeps date logic deterministic. DST is a documented production improvement. |
+| Response signing | Overdue response is HMAC-signed and verified by n8n. The empty request acknowledgement is not signed | Closes the "both directions" ambiguity and protects the PII-bearing response. The ack carries no data. |
+| Audit scope | Audit writes only, never reads. Admin promotion and demotion are audited | Convex queries cannot write. A mutation fired on page load to record a view is a write-on-read smell. |
+| n8n version | Pin the exact image version after the first successful smoke test; never use `latest` | Import and activation commands changed between major versions. The README records the tested version. |
+| Tunnel exposure | cloudflared tunnels to a path-filtering proxy, not to n8n directly; the n8n editor binds to localhost | A quick tunnel to n8n would expose the editor and REST API, and with env access enabled, every secret. |
 
-## 4. Non-goals and explicit cuts
+## 4. Non-goals
 
-- No email, Slack, or Discord delivery. The mock channel is n8n writing a signed status back to Convex.
-- No image uploads, avatars, or tool photos. Initials and category icons only.
-- No chat, ratings, reviews, or payments.
-- No self-hosted Convex.
-- No Neighborhood or multi-tenant model. One board, many neighbors.
-- No Playwright E2E suite. A focused Vitest plus `convex-test` suite covers RBAC, state transitions, signing, and idempotency.
-- No dark mode. Tokens are structured so it can be added later.
-- No live deployment. Delivery is the repo, verified locally, with screenshots and a reviewer walkthrough in the README.
+- image uploads and photo moderation
+- chat or messaging
+- dark mode
+- payment or deposits
+- email, SMS, or push delivery. The channel is a logged mock.
+- per-user timezones and DST-correct board dates
+- Playwright or Cypress
+- live deployment
+- self-hosted Convex
+- AI features. Nothing in this brief needs a model call.
 
 ## 5. Architecture
 
-### 5.1 Runtime shape
+### 5.1 System diagram
 
 ```mermaid
 flowchart LR
-  Browser[Next.js browser app] -->|Convex client + Clerk JWT| Convex[Convex deployment]
-  Browser -->|sign in| Clerk[Clerk hosted]
-  Convex -->|signed POST webhook| Tunnel[cloudflared tunnel]
-  Tunnel --> N8N[n8n container]
-  N8N -->|signed POST status| ConvexSite[Convex HTTP actions]
-  N8N -->|daily schedule| ConvexSite
-  N8N --> Postgres[(n8n Postgres)]
+  U[Browser] -->|HTTPS| Next[Next.js app]
+  Next -->|queries and mutations| Convex[(Convex Cloud)]
+  Next -->|Clerk session| Clerk[Clerk]
+  Convex -->|auth.config.ts + JWKS| Clerk
+  Convex -->|signed webhook POST| Tunnel[cloudflared tunnel]
+  Tunnel --> Proxy[nginx path filter]
+  Proxy -->|only /webhook/*| N8N[n8n]
+  N8N -->|signed POST, claims and write-backs| ConvexSite[Convex HTTP actions]
+  N8N --> PG[(Postgres)]
   Convex --> DB[(Convex database)]
 ```
 
-Key point: Convex Cloud cannot reach `localhost`. The compose stack includes a `cloudflared` quick tunnel so Convex's outbound webhook has a public URL that forwards to the local n8n container. The tunnel URL changes on each start, so a small setup script reads it and writes `N8N_WEBHOOK_URL` into the Convex deployment environment.
+Key point: Convex Cloud cannot reach `localhost`. The compose stack includes a `cloudflared` quick tunnel whose public URL forwards only `/webhook/*` to n8n through an nginx proxy. The n8n editor is bound to `127.0.0.1:5678` and is never exposed through the tunnel. The tunnel URL changes on each start, so the setup script reads it and writes the full webhook URL into the Convex deployment environment.
 
 ### 5.2 Repository layout
 
-```
+```text
 lendloop/
   src/
     app/
@@ -113,135 +122,147 @@ lendloop/
       errors.ts                    ConvexError code mapping to toasts
       format.ts                    dates, labels, initials
       hooks/use-current-user.ts
+    middleware.ts                  Clerk middleware
+    app/fonts/                     self-hosted font files
   convex/
     schema.ts
-    auth.config.ts
+    auth.config.ts                 applicationID: "convex"
     http.ts                        signed n8n endpoints + health
-    crons.ts                       outbox sweep + daily housekeeping
+    crons.ts                       outbox sweep, nonce cleanup, request expiry
     users.ts
     tools.ts
     loans.ts
-    automation.ts                  outbox dispatcher + reminder write-backs
+    automation.ts                  outbox claim/dispatch, reminder claims
     admin.ts
-    seed.ts
+    seed.ts                        internalMutation only
     lib/
-      auth.ts                      requireUser, requireAdmin, ownership
-      permissions.ts               pure, unit-testable rules
-      hmac.ts                      canonical JSON, sign, verify, timing-safe compare
-      dates.ts                     YYYY-MM-DD helpers, overlap
-      errors.ts                    ConvexError codes
-      validators.ts                shared validators and limits
-    tests/                         convex-test suites
-  n8n/
-    workflows/
-      01-request-notifications.json
-      02-overdue-reminders.json
-      03-error-handler.json
+      auth.ts                      requireUser, requireAdmin, ownership, read scoping
+      hmac.ts                      Web Crypto HMAC + constant-time compare
+      canonical.ts                 canonical JSON
+      date.ts                      board date and daysOverdue
+      validate.ts                  hand-written HTTP payload validation
+      payloads.ts                  outbound payload builder
+      errors.ts                    error codes
+  workflows/
+    request-notification.json
+    overdue-reminders.json
+    error-handler.json
+  docker/
+    nginx.conf                     path filter for /webhook/*
+    Dockerfile.app
   scripts/
-    setup.mjs                      validate env, deploy functions, start stack, link tunnel
-    seed.mjs
+    setup.mjs                      idempotent local setup
+    seed.mjs                       calls the internal seed mutation
+    verify-workflows.mjs           JSON assertions + canonicalizer parity
+    tunnel-sync.mjs                re-reads the tunnel and updates Convex env
+  tests/
+    convex/                        convex-test suites
   docs/
     architecture.md
     security.md
     n8n-integration.md
-    decisions.md
     production.md
-    superpowers/specs/2026-11-02-lendloop-design.md
+    walkthrough.md
+    images/                        screenshots
+  docs/superpowers/specs/          this design document
   docker-compose.yml
-  Dockerfile
   .env.example
   README.md
 ```
 
-### 5.3 Main request flows
+### 5.3 Key flows
 
-- **Sign in:** Clerk session token includes a `convex` JWT template. Convex verifies the JWT via the issuer. `users.ensure` upserts a Convex user keyed by Clerk `subject` and applies admin bootstrapping from `ADMIN_EMAILS`.
-- **Create listing:** mutation validates input, derives the owner from `ctx.auth`, writes the tool, writes an audit row.
-- **Request to borrow:** mutation validates dates and overlap, snapshots the tool name and category onto the loan, writes the loan, writes an `automationEvent` and an `outbox` row, then schedules the dispatcher action.
-- **Dispatcher:** action signs the minimized payload, POSTs to n8n, records delivery or reschedules with backoff. A cron sweeps stuck rows.
-- **n8n request workflow:** verifies the signature, composes a message, logs it as the mock channel, writes status back to Convex with the same `eventId`. Only then does it return 200, so a failed write-back causes a Convex retry.
-- **Status changes:** approve, decline, cancel, and return each write an event and enqueue a notification through the same outbox.
-- **Overdue:** n8n runs daily, calls the signed overdue endpoint, sends a mock reminder per loan, and writes back a `reminderKey` that is unique per loan per day.
+**Request notification.** A loan mutation writes the state change, an `automationEvent` with `status: "queued"`, and an `outbox` row in one transaction. The mutation schedules the dispatcher. The dispatcher atomically claims the row, signs the minimized payload, POSTs it to n8n, and records delivery or reschedules with backoff. n8n verifies the signature, logs the mock notification, writes `delivered` back to Convex, and only then returns 200. A failed write-back returns non-200, so the outbox retries the whole event.
+
+**Status changes.** Approve, decline, cancel, and return each write an event and enqueue a notification through the same outbox.
+
+**Overdue reminders.** n8n runs daily and calls the signed `/n8n/overdue` endpoint. Convex claims each due reminder transactionally and returns claims with a `claimToken`. n8n logs a mock reminder per claim and writes `sent` or `failed` back with the token. A stale claim lease allows a retry without letting two concurrent runs send the same reminder.
+
+**Seed adoption.** The seed creates placeholder users whose `clerkId` is `seed:<email>`. On first sign-in, `users.ensure` matches a verified Clerk email to the placeholder, replaces the Clerk id, and preserves the seeded role, tools, and loans.
 
 ## 6. Data model
 
-All tables use explicit validators. Dates for loans are stored as `YYYY-MM-DD` strings so range checks and lexicographic comparison are simple and stable. Timestamps are epoch milliseconds.
+All tables use explicit validators. Loan dates are stored as `YYYY-MM-DD` strings so range checks and lexicographic comparison are simple and stable. Timestamps are epoch milliseconds. Convex indexes are not unique; every "unique" key below is enforced by a read-then-insert inside one mutation, which Convex's serializable transactions make safe. Comments say "logically unique," not "unique index."
 
 ### users
 
 ```ts
 {
-  clerkId: string,        // Clerk subject, unique
-  email: string,          // normalized lowercase
+  clerkId: string,          // Clerk subject; seed placeholders use "seed:<email>"
+  email: string,            // normalized lowercase
   name: string,
   imageUrl?: string,
   role: "user" | "admin",
   trustedLender: boolean,
+  adoptedAt?: number,       // set when a seed placeholder is claimed
   createdAt: number,
+  updatedAt: number,
 }
 ```
 
-Indexes: `by_clerk_id`, `by_email`.
+Indexes: `by_clerk_id`, `by_email`. Both are logically unique and enforced in `users.ensure`.
 
 ### tools
 
 ```ts
 {
   ownerId: Id<"users">,
-  name: string,           // 2..80 chars
+  name: string,             // 2..80 chars
   category: "power" | "garden" | "kitchen" | "camping" | "hand_tools" | "other",
   condition: "new" | "good" | "fair" | "well_loved",
-  description: string,    // 10..600 chars
+  description: string,      // 10..600 chars
   status: "active" | "removed",
+  seedKey?: string,         // marks demo rows for reset
   removedAt?: number,
   createdAt: number,
   updatedAt: number,
 }
 ```
 
-Indexes: `by_owner`, `by_status_category` on `["status", "category"]`.
+Indexes: `by_owner_status` on `["ownerId", "status"]`, `by_status_category` on `["status", "category"]`, `by_seed_key`.
 
-Soft removal preserves loan history and avoids broken references. A removed tool disappears from browse and cannot receive new requests. Pending requests on a removed tool are declined automatically. Approved loans remain valid until returned.
+Soft removal preserves loan history and avoids broken references. Removed tools are hidden from public and browse queries, cannot receive new requests, and are visible only to their owner and admins. The UI calls this "Remove", and the README states that removal is soft.
 
 ### loans
 
 ```ts
 {
   toolId: Id<"tools">,
-  lenderId: Id<"users">,      // denormalized at creation
   borrowerId: Id<"users">,
-  toolName: string,           // snapshot, survives edits/removal
-  toolCategory: string,       // snapshot
-  startDate: string,          // YYYY-MM-DD, inclusive
-  endDate: string,            // YYYY-MM-DD, inclusive
-  status: "pending" | "approved" | "declined" | "cancelled" | "returned",
-  message?: string,           // 0..400 chars
-  respondedAt?: number,
+  lenderId: Id<"users">,
+  toolName: string,         // snapshot
+  toolCategory: string,     // snapshot
+  startDate: string,        // YYYY-MM-DD
+  endDate: string,
+  status: "pending" | "approved" | "declined" | "cancelled" | "returned" | "expired",
+  message?: string,         // 0..300 chars
+  seedKey?: string,
+  requestedAt: number,
+  decidedAt?: number,
   returnedAt?: number,
-  returnedById?: Id<"users">,
-  declineReason?: string,
+  returnedBy?: Id<"users">,
   createdAt: number,
   updatedAt: number,
 }
 ```
 
-Indexes: `by_tool`, `by_lender_status`, `by_borrower_status`, `by_status_endDate` on `["status", "endDate"]`.
+Indexes: `by_tool_status_startDate` on `["toolId", "status", "startDate"]`, `by_borrower_status` on `["borrowerId", "status"]`, `by_lender_status` on `["lenderId", "status"]`, `by_status_endDate` on `["status", "endDate"]`, `by_seed_key`.
 
-Overdue is derived: `status === "approved" && endDate < today`. No stored `overdue` status, so no cron needs to mutate loan rows.
+Snapshotting `toolName` and `toolCategory` keeps history readable after a tool is edited or removed.
+
+Overlap check: query approved loans for the tool with `startDate <= requestedEndDate` using `by_tool_status_startDate`, then filter in memory for `endDate >= requestedStartDate`. The per-tool loan history is small; the query is bounded with `take(200)` and the bound is documented.
 
 ### automationEvents
 
-One row per notification or reminder event, used for the per-loan timeline and for outbox correlation.
-
 ```ts
 {
-  eventId: string,            // stable idempotency key
+  eventId: string,          // logically unique; outbox event id or reminder key
   loanId: Id<"loans">,
-  type: "loan.requested" | "loan.approved" | "loan.declined" | "loan.cancelled" | "loan.returned" | "overdue.reminder",
   direction: "outbound" | "inbound",
-  channel: string,            // "mock" for now
+  eventType: string,        // "request.created", "overdue.reminder", etc.
+  channel: string,          // "mock"
   status: "queued" | "delivered" | "failed" | "received",
-  detail?: string,            // short human-readable summary, no PII beyond names
+  detail?: string,          // short summary; names only, no email or address
   createdAt: number,
   updatedAt: number,
 }
@@ -255,10 +276,17 @@ Reliable outbound delivery.
 
 ```ts
 {
-  eventId: string,
-  payloadJson: string,        // minimized payload, signed over canonical form
+  eventId: string,          // logically unique
+  eventType: string,
+  loanId: Id<"loans">,
+  recipientUserId: Id<"users">,
+  payloadJson: string,      // canonical source of truth for the signed payload
   status: "pending" | "sending" | "sent" | "failed",
   attempts: number,
+  claimToken?: string,
+  claimedAt?: number,
+  lastAttemptAt?: number,
+  alertedAt?: number,
   nextAttemptAt: number,
   lastError?: string,
   createdAt: number,
@@ -266,34 +294,39 @@ Reliable outbound delivery.
 }
 ```
 
-Indexes: `by_event_id`, `by_status_nextAttemptAt`.
+Indexes: `by_event_id`, `by_status_nextAttemptAt`, `by_status_claimedAt`.
 
 ### reminders
 
-Idempotent overdue reminder records written back by n8n.
+Idempotent overdue reminder records, claimed before send and completed after.
 
 ```ts
 {
   loanId: Id<"loans">,
-  reminderKey: string,        // `${loanId}:${YYYY-MM-DD}`, unique
+  reminderKey: string,      // `${loanId}:${YYYY-MM-DD}`, logically unique
   reminderDate: string,
-  channel: string,            // "mock"
-  status: "sent" | "failed",
-  sentAt: number,
+  channel: string,          // "mock"
+  status: "claimed" | "sent" | "failed",
+  claimToken?: string,
+  claimedAt?: number,
+  attemptedAt?: number,
+  sentAt?: number,          // absent for failed rows
   error?: string,
+  createdAt: number,
+  updatedAt: number,
 }
 ```
 
-Index `by_reminder_key`.
+Indexes: `by_reminder_key`, `by_status_claimedAt`.
 
 ### auditLog
 
-Admin and destructive actions.
+Admin writes only. Append-only by application code and a test.
 
 ```ts
 {
   actorId?: Id<"users">,
-  action: string,             // "tool.remove", "user.setTrusted", "admin.viewLoans"
+  action: string,           // "tool.remove", "user.setTrusted", "user.promote", "user.demote", "alert.resolve"
   targetType: string,
   targetId: string,
   detail?: string,
@@ -305,19 +338,35 @@ Index `by_createdAt`.
 
 ### automationAlerts
 
-Visible failures reported by the n8n error workflow.
+Visible failures reported by the n8n error workflow or the outbox.
 
 ```ts
 {
-  alertId: string,            // n8n execution id, unique
-  workflowName: string,
-  executionId: string,
-  message: string,
+  alertId: string,          // logically unique; n8n execution id or "outbox:<eventId>:<attempt>"
+  source: "n8n" | "outbox",
+  workflowName?: string,
+  executionId?: string,
+  message: string,          // truncated; no payload PII
+  resolvedAt?: number,
   createdAt: number,
 }
 ```
 
-Index `by_alert_id`.
+Indexes: `by_alert_id`, `by_createdAt`, `by_resolvedAt`.
+
+### usedNonces
+
+Replay protection for signed HTTP requests.
+
+```ts
+{
+  nonce: string,            // logically unique
+  expiresAt: number,
+  createdAt: number,
+}
+```
+
+Indexes: `by_nonce`, `by_expiresAt`.
 
 ## 7. Domain rules and RBAC
 
@@ -329,470 +378,542 @@ stateDiagram-v2
   pending --> approved: lender approves
   pending --> declined: lender declines
   pending --> cancelled: borrower cancels
+  pending --> expired: endDate passes
   approved --> returned: lender or borrower marks returned
   declined --> [*]
   cancelled --> [*]
+  expired --> [*]
   returned --> [*]
 ```
 
 Rules:
 
 - A borrower cannot request their own tool.
-- A tool must be active.
-- `startDate <= endDate`, `startDate >= today`, and the range cannot exceed 60 days.
+- A tool must be active at request time.
+- `startDate <= endDate`, the range cannot exceed 60 days, and `startDate >= boardToday - 1 day`. The one-day grace prevents a user in a nearby timezone from being rejected for the date they just picked. `endDate >= boardToday - 1 day`.
 - A new request cannot overlap an existing approved loan for the same tool.
-- Approving a request re-checks overlap against all other approved loans and fails with `CONFLICT` if another approval won the race.
+- Approving a request re-checks that the tool is still active, that `endDate >= boardToday`, and that no other approved loan overlaps. It fails with `CONFLICT` if another approval won the race.
 - Approve and decline are allowed only from `pending`.
 - Cancel is allowed only by the borrower and only from `pending`.
 - Mark returned is allowed by the lender or the borrower, only from `approved`.
-- Removed tools cannot receive new requests; pending requests on removal are declined with a clear reason.
+- A pending request whose `endDate < boardToday - 1 day` is expired. A cron marks it `expired`; queries also treat it as expired so the rule is correct between cron runs.
+- Removed tools cannot receive new requests; pending requests on removal are declined with the reason `TOOL_REMOVED`.
 - A user may hold at most 5 pending requests per tool and 50 active listings. These guards are cheap abuse prevention.
+- A borrower may hold at most 20 pending requests in total. This closes the "50 listings times 5 per tool" gap.
 
-**Board timezone.** `BOARD_TIMEZONE` (default `UTC`) defines "today" for start date validation, availability, overdue detection, and `daysOverdue`. It is computed once per request with `Intl.DateTimeFormat("en-CA", { timeZone })`, which returns `YYYY-MM-DD`. Request start dates accept a one-day grace so a user in a nearby timezone is never rejected for picking the date they see on their own calendar. All range comparisons remain string comparisons on `YYYY-MM-DD`. Per-user timezones are a documented production improvement.
+**Board date.** `boardToday` is computed in `convex/lib/date.ts` as:
+
+```ts
+new Date(Date.now() + BOARD_UTC_OFFSET_MINUTES * 60_000)
+  .toISOString()
+  .slice(0, 10)
+```
+
+No `Intl`, no ICU dependency. `BOARD_UTC_OFFSET_MINUTES` defaults to `0`. The README tells the reviewer to set their local offset. DST is a documented production improvement; a fixed offset is correct for the duration of a demo. All range comparisons are string comparisons on `YYYY-MM-DD`. `daysOverdue` is computed from UTC midnight of `endDate` to UTC midnight of `boardToday`.
+
+The exact validation predicate lives in one pure function, `isValidRequestRange(startDate, endDate, boardToday)`, used by mutations and tested directly.
 
 ### 7.2 Availability
 
 Derived, never stored:
 
-- `on_loan`: there is an approved loan where `startDate <= today <= endDate`.
-- `reserved`: there is an approved loan with `startDate > today`.
-- `available`: otherwise.
+- `on_loan`: an approved loan where `startDate <= boardToday <= endDate`.
+- `reserved`: an approved loan where `startDate > boardToday`.
+- `available`: no approved loan covering or following today.
 
-Public list shows active tools that are not `on_loan` today, with name and category only.
+`nextAvailableDate` is `max(endDate of approved loans) + 1 day`, or today when available.
+
+The public list shows only tools that are `available` today, because the brief asks for "available tools." The authenticated browse shows every active tool with its status and `nextAvailableDate`, and allows a request for any non-overlapping future range. This resolves the case where a tool on loan today is legitimately requestable for next week.
 
 ### 7.3 RBAC matrix
 
-| Action | Anonymous | User | Admin |
+| Capability | Public | User | Admin |
 |---|---|---|---|
-| Read public tool list | yes, name and category only | yes | yes |
-| Read full tool list with owner and availability | no | yes | yes |
-| Create listing | no | yes, owner is self | yes |
-| Edit or remove own listing | no | yes | yes |
-| Edit or remove any listing | no | no | yes |
-| Request to borrow | no | yes, as self | yes |
-| Cancel own pending request | no | yes | yes |
-| Approve or decline incoming request | no | lender only | lender only, plus admin read access |
-| Mark returned | no | lender or borrower | lender or borrower |
-| View "My listings", "My requests" | no | self only | self only |
+| See public available tools (name and category only) | yes | yes | yes |
+| Browse all active tools with status and owner name | no | yes | yes |
+| View a tool's full detail | no | yes | yes |
+| Create a listing | no | yes | yes |
+| Edit own listing | no | yes | yes |
+| Edit another user's listing | no | no | no |
+| Remove own listing (soft) | no | yes | yes |
+| Remove another user's listing (soft, audited) | no | no | yes |
+| Request a tool | no | yes, not own | yes, not own |
+| Approve or decline a request | no | lender only | lender only |
+| Cancel a pending request | no | borrower only | borrower only |
+| Mark an approved loan returned | no | lender or borrower | lender or borrower |
+| View own requests | no | yes | yes |
+| View incoming requests on own tools | no | yes | yes |
+| View a loan detail and timeline | no | borrower or lender | yes, read-only |
 | View all loans | no | no | yes |
-| Mark a lender trusted | no | no | yes |
-| View automation health and alerts | no | no | yes |
+| Mark or unmark a trusted lender | no | no | yes |
+| Resolve an automation alert | no | no | yes |
+| Impersonate or edit another user's loans | no | no | no |
 
-Admins are not automatically allowed to act on other users' loans. The brief gives admins removal and visibility powers, not impersonation. This is deliberate: it keeps the authorization model easy to reason about. Document it.
+Admin removal and trusted-lender changes are audited. Viewing all loans is authorized but not audited, because it is a read.
+
+Read scoping is explicit: `loans.getDetail`, `loans.timeline`, and `tools.getDetail` take an id and must check that the caller is a party or an admin. Unauthorized and missing rows both return `NOT_FOUND`, so ids cannot be probed.
+
+`trustedLender` is a visual trust signal only. It grants no permission and changes no query result beyond the badge. All list queries are bounded: public and browse lists take at most 60, admin loans and audit lists are paginated at 50 per page or capped at 200, and a loan timeline returns at most 50 events.
 
 ### 7.4 Enforcement pattern
 
-Every protected query, mutation, and HTTP handler follows the same shape:
+Every protected query and mutation starts with:
 
-1. Derive the caller with `ctx.auth.getUserIdentity()`.
-2. Load the Convex user row. Throw `UNAUTHENTICATED` if missing.
-3. Load the target record. Throw `NOT_FOUND` for missing or removed records where appropriate.
-4. Call a pure permission function from `convex/lib/permissions.ts` with the caller, the record, and the action.
-5. Throw `ConvexError({ code: "FORBIDDEN" })` on denial.
-6. Validate state transition separately from authorization.
+```ts
+const user = await requireUser(ctx);        // loads the Convex user row by identity.subject
+// or
+const admin = await requireAdmin(ctx);      // requireUser plus role check
+```
 
-The pure functions are unit-tested without Convex, and the mutations are tested with `convex-test` under different identities. User ids, roles, and ownership never come from client arguments.
+`requireUser` throws `UNAUTHENTICATED` when there is no Clerk identity or no Convex user row. Ownership helpers (`requireToolOwner`, `requireLoanParty`, `requireLoanLender`, `requireLoanBorrower`) throw `NOT_FOUND` for non-parties and `FORBIDDEN` only for public-resource role failures.
 
-Admins are identified by role in the Convex `users` table, seeded from the `ADMIN_EMAILS` Convex environment variable on `users.ensure`. Promotion is additive only, so a typo in the env var cannot silently demote the only admin. A CLI-runnable internal mutation exists for manual reconciliation.
+Convex HTTP actions do not receive a Clerk session. The `/n8n/*` handlers use a separate `requireSignature` wrapper and never call `requireUser`. This carve-out is explicit in `docs/security.md`; a shared Clerk wrapper would reject every n8n write-back.
+
+**User sync.** `users.ensure` is called after sign-in and is idempotent:
+
+1. Read the Clerk identity. Throw `UNAUTHENTICATED` if absent.
+2. Require `identity.email` and `identity.emailVerified === true`. Throw `EMAIL_UNVERIFIED` otherwise. Phone-only users are unsupported and documented.
+3. Normalize the email to lowercase.
+4. Look up by `clerkId`. If found, return the row.
+5. Look up by email.
+   - If the row's `clerkId` starts with `seed:` and `adoptedAt` is absent, adopt it: set `clerkId` to the Clerk subject, update `name` and `imageUrl`, and set `adoptedAt`. Keep the role, tools, and loans.
+   - If the row belongs to another real Clerk subject, throw `ACCOUNT_CONFLICT`. Never silently merge two identities.
+6. If no row exists, insert a user. The role is `admin` only when the verified email is in `ADMIN_EMAILS`; otherwise `user`.
+7. If an existing non-admin's verified email is in `ADMIN_EMAILS`, promote to `admin` and write an audit row. Promotion is additive. Demotion is never automatic; `admin.demote` is an internal mutation run by the operator and writes an audit row.
+
+`ADMIN_EMAILS` is parsed once from the environment, lowercased, trimmed, and compared exactly. The README requires the reviewer to use a verified email and to enable email verification in Clerk. This closes the unverified-email privilege-escalation path.
 
 ## 8. Public data minimization
 
-`tools.publicList` returns an explicit projection:
+- `tools.publicList` is unauthenticated, returns at most 60 tools, and projects only `{ _id, name, category }`. It filters to active tools that are `available` today.
+- It never returns owner id, owner name, description, condition, image, dates, or loan data.
+- The public page has no query that accepts a user id.
+- Authenticated queries return the owner's display name and trusted badge because borrowing from a neighbor requires knowing who they are. Email addresses are never returned to other users.
+- Removed tools are absent from public and browse results.
 
-```ts
-{ _id, name, category }
-```
-
-It does not return `ownerId`, owner name, condition, description, or any loan data. The UI cannot leak what the query never sends. The README explains that this is both a privacy decision and a direct response to the brief.
-
-Authenticated queries return owner display name and trusted status, because borrowing from a neighbor requires knowing who they are.
+Availability is computed in one query: take the bounded tool set, then read approved loans with `endDate >= boardToday` in one indexed range and build a map by tool id. This avoids an N+1 read.
 
 ## 9. n8n integration
 
-### 9.1 Event flow
+### 9.1 Topology
 
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant C as Convex
-  participant O as Outbox
-  participant N as n8n
-  participant A as Convex HTTP
+- Compose runs n8n, Postgres, a one-shot importer, an nginx proxy, and cloudflared.
+- cloudflared forwards to the proxy. The proxy passes only `/webhook/*` and `/webhook-test/*` to n8n and returns 404 for everything else. The n8n editor and REST API are not reachable from the tunnel.
+- n8n publishes `127.0.0.1:5678:5678`, so the editor is local-only.
+- Secrets are injected as environment variables from `.env`; exported workflow JSON contains only `$env` references.
 
-  U->>C: request/approve/decline/cancel/return
-  C->>C: write loan + automationEvent + outbox (transaction)
-  C-->>O: scheduler dispatch
-  O->>N: signed POST webhook
-  N->>N: verify signature, compose mock message
-  N->>A: signed POST status (same eventId)
-  A->>C: idempotent update of automationEvent
-  N-->>O: 200
-  O->>C: mark sent
-```
+### 9.2 Signing
 
-Overdue flow:
+**Canonical string.** Both sides build the same UTF-8 string, joined by `\n`:
 
-```mermaid
-sequenceDiagram
-  participant S as Schedule (daily)
-  participant N as n8n
-  participant A as Convex HTTP
-  participant C as Convex
-
-  S->>N: trigger
-  N->>A: signed POST /n8n/overdue
-  A->>C: query approved loans past endDate, not reminded today
-  C-->>A: minimal loan list
-  A-->>N: minimal loan list
-  N->>N: loop, compose and log mock reminder
-  N->>A: signed POST /n8n/reminder-status
-  A->>C: insert-or-ignore reminder by reminderKey
-  A->>C: append automationEvent for loan timeline
-```
-
-### 9.2 Signing scheme
-
-Both directions use HMAC-SHA256 with different secrets:
-
-- `N8N_OUTBOUND_SECRET`: Convex signs, n8n verifies.
-- `N8N_INBOUND_SECRET`: n8n signs, Convex verifies.
-
-Canonical string:
-
-```
+```text
 v1
-<unix timestamp seconds>
-<nonce or event id>
-<canonical JSON of payload>
+<HTTP_METHOD>
+<PATH>
+<UNIX_TIMESTAMP_SECONDS>
+<NONCE>
+<CANONICAL_JSON>
 ```
 
-`canonical JSON` means recursively sorted object keys, arrays kept in order, `JSON.stringify` with no whitespace, and standard JSON number serialization. Signing the canonical form instead of raw bytes avoids the classic problem where two JSON serializers produce different whitespace and break verification. The same canonicalizer is implemented in TypeScript and in the n8n Code node, with shared test vectors in `docs/n8n-integration.md`.
+- `HTTP_METHOD` is uppercase (`POST`).
+- `PATH` is the exact request path, such as `/n8n/overdue`. Including method and path prevents a valid body from being replayed to a different endpoint.
+- `CANONICAL_JSON` is JSON with recursively sorted object keys, no insignificant whitespace, and numbers serialized by `JSON.stringify`. Non-finite numbers are rejected.
+- The signature is `HMAC-SHA256(secret, canonicalString)` encoded as lowercase hex.
 
-Request headers:
+**Headers.**
 
-- `x-lendloop-timestamp`: Unix seconds.
-- `x-lendloop-nonce`: random or event id, used for log correlation.
-- `x-lendloop-signature`: `v1=<hex>`.
-
-Verification rules on both sides:
-
-- Reject a timestamp more than 300 seconds from now.
-- Recompute the HMAC and compare with a constant-time comparison.
-- Reject a missing or malformed header before doing any work.
-- Never log the secret or the full signature.
-
-**Responses are not signed.** n8n verifies every request payload it receives, and Convex verifies every write-back. The overdue response and the webhook 200 acknowledgement are not HMAC-signed: they travel over TLS inside a request the receiver initiated, and the only consumer is the workflow that made the call. Signing them would add a verification node and test vectors without changing the threat model. This is written up in `docs/n8n-integration.md` so the choice reads as deliberate rather than forgotten.
-
-Write endpoints rely on idempotency keys on top of the timestamp window. A replayed write with a known key is a no-op that returns 200, which is safer for retries than a hard rejection.
-
-### 9.3 Outbox and retries
-
-The loan mutation writes the domain change and the outbox row in one Convex transaction, so there is no window where a loan exists but its notification was forgotten. The transaction schedules `internal.automation.dispatchOutbox`.
-
-Dispatcher behavior:
-
-- Load the row. If it is not `pending`, return.
-- Mark `sending`, increment `attempts`, and compute the signature.
-- POST to `N8N_WEBHOOK_URL` with a 10 second timeout.
-- On 2xx, mark `sent` and set the automation event to `delivered`.
-- On failure, store `lastError`. If attempts remain, set `pending` with a backoff delay (30s, 2m, 10m, 1h, 6h) and reschedule. After six attempts, mark `failed`, mark the event `failed`, and write an `automationAlerts` row.
-- A five-minute cron sweeps `pending` rows whose `nextAttemptAt` has passed, so a lost scheduler callback cannot strand a row.
-
-The admin automation view shows queued, failed, and delivered counts, plus the last errors. Failures are visible in the product, not only in logs.
-
-### 9.4 Endpoint contract
-
-`POST /n8n/overdue` (n8n to Convex, signed)
-
-Request:
-
-```json
-{ "limit": 100 }
+```text
+X-LendLoop-Signature: <hex>
+X-LendLoop-Timestamp: <unix seconds>
+X-LendLoop-Nonce: <uuid v4>
+X-LendLoop-Key-Id: v1
 ```
 
-Response:
+**Verification.** Recompute the canonical string from the raw request method, path, headers, and parsed body. Compare in constant time. Reject if the timestamp is more than 300 seconds from now. Consume the nonce through a `consumeNonce` mutation; if it already exists and has not expired, reject as `REPLAY`. Delete expired nonces with a cron. Verify before parsing business fields or doing any database work other than nonce consumption.
 
-```json
-{
-  "generatedAt": 1762080000000,
-  "loans": [
-    {
-      "loanId": "jd7...",
-      "reminderKey": "jd7...:2026-11-02",
-      "toolName": "Cordless drill",
-      "dueDate": "2026-10-30",
-      "daysOverdue": 3,
-      "borrower": { "name": "Sam", "email": "sam@example.com" },
-      "lenderName": "Alex"
-    }
-  ]
-}
+**Convex runtime.** `convex/lib/hmac.ts` uses Web Crypto, not Node's `timingSafeEqual`:
+
+```ts
+const key = await crypto.subtle.importKey(
+  "raw", new TextEncoder().encode(secret),
+  { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+);
+const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(canonical)));
 ```
 
-The endpoint excludes loans already reminded on the board's current date and caps results at 200. Pagination is a documented production improvement. The response is not HMAC-signed; see the note in 9.2.
+Hex-encode the result and compare with a hand-rolled constant-time loop over equal-length strings. A length mismatch fails without early exit. This works in the default Convex runtime. No `"use node"` file is needed.
 
-`POST /n8n/reminder-status` (n8n to Convex, signed)
+**n8n runtime.** The Code nodes need `crypto`. The compose service sets `NODE_FUNCTION_ALLOW_BUILTIN=crypto`. On n8n 2.x, the same allowlist is set on the task runner. A smoke test signs and verifies before the workflows are considered done.
 
-```json
-{
-  "loanId": "jd7...",
-  "reminderKey": "jd7...:2026-11-02",
-  "reminderDate": "2026-11-02",
-  "channel": "mock",
-  "status": "sent",
-  "sentAt": 1762080000000,
-  "error": null
-}
-```
+**Response signing.** `/n8n/overdue` returns data, so the response body is signed with `CONVEX_TO_N8N_SECRET` using the same scheme, with method `POST` and path `/n8n/overdue`. n8n verifies it in a Code node before processing claims. The `/n8n/event-status` and `/n8n/reminder-status` responses are `{ ok: true }` acknowledgements with no data and are not signed.
 
-Behavior: insert if `reminderKey` is new, otherwise update status and error. Always append one `automationEvent` per `reminderKey`, using the key as the event id so retries cannot duplicate the timeline entry.
+**Secrets and rotation.**
 
-`POST /n8n/automation-event` (n8n to Convex, signed)
+| Secret | Direction | Used by |
+|---|---|---|
+| `CONVEX_TO_N8N_SECRET` | Convex signs, n8n verifies | outbound events, overdue response |
+| `N8N_TO_CONVEX_SECRET` | n8n signs, Convex verifies | overdue request, all write-backs, alerts |
 
-Used by the request workflow to write delivery status back.
+Each verifier also accepts `<NAME>_PREVIOUS` when present, for a dual-secret rotation window. Rotate by setting the previous value, deploying the new value on the sender, then removing the previous value after in-flight retries drain. The README documents the procedure.
+
+**Secret storage.** Secrets live in `.env` and are injected into both compose services. They are never written into workflow JSON, which references `{{ $env.CONVEX_SITE_URL }}` and `{{ $env.*_SECRET }}`. `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` is required for Code nodes; its blast radius is limited by the localhost-only editor and the path-filtering proxy. This trade-off is stated in `docs/security.md`.
+
+### 9.3 Transactional outbox
+
+**Enqueue.** The loan mutation writes the loan, the `automationEvent`, and the outbox row in one transaction. The mutation schedules `internal.automation.dispatch` with the outbox id.
+
+**Atomic claim.** `internal.automation.claimOutbox` loads the row and patches it only when `status === "pending"` and `nextAttemptAt <= now`. It sets `status: "sending"`, `claimToken: uuid`, `claimedAt: now`, `lastAttemptAt: now`, and increments `attempts`. It returns the payload and token, or `null`. Because the mutation is serializable, two dispatchers cannot both claim the row.
+
+**Dispatch action.** Calls `claimOutbox`. If `null`, returns. Otherwise POSTs to the full `N8N_WEBHOOK_URL` with a 10-second timeout and the signature headers plus `Idempotency-Key: <eventId>`.
+
+- 2xx: call `markOutboxSent` with the claim token. The mutation patches only if the token still matches, so a dispatcher whose lease was swept cannot mark a reclaimed row.
+- 429 or 5xx: `markOutboxRetry` with the token. It sets `status: "pending"`, clears the token, sets the next backoff, and stores a short `lastError`. After the third failed attempt it writes an `automationAlert` once (`source: "outbox"`, `alertedAt` set) and keeps retrying.
+- Other 4xx: `markOutboxFailed` with the token. It sets `status: "failed"` and writes an alert, because a 4xx usually means a configuration or signature error that retrying will not fix.
+- Attempts exhausted: `status: "failed"`, the linked `automationEvent` is marked `failed`, and an alert is written.
+
+**Backoff.** 30 seconds, 2 minutes, 10 minutes, 30 minutes, 2 hours. Six attempts total, about 2 hours 42 minutes. A request is not left unnotified for most of a day, and the admin alert fires at 10 minutes.
+
+**Sweep.** A five-minute cron:
+
+- `pending` rows with `nextAttemptAt <= now` are scheduled for dispatch.
+- `sending` rows with `claimedAt < now - 2 minutes` are reset to `pending`, with the token cleared and `nextAttemptAt = now`. This recovers a crash between mark and POST.
+- `sent` and `failed` are terminal.
+- The admin view counts `pending`, `sending`, `sent`, and `failed`, so a stranded row is visible even before the sweep.
+
+**Payload.** Defined once in `convex/lib/payloads.ts`:
 
 ```json
 {
   "eventId": "uuid",
-  "loanId": "jd7...",
-  "status": "delivered",
-  "channel": "mock",
-  "detail": "Request notification sent (mock)"
+  "eventType": "request.created",
+  "loanId": "id",
+  "toolName": "Cordless drill",
+  "toolCategory": "power",
+  "startDate": "2026-11-05",
+  "endDate": "2026-11-12",
+  "status": "pending",
+  "recipient": { "userId": "id", "name": "Sam" },
+  "actor": { "userId": "id", "name": "Rider" },
+  "occurredAt": 1762300000000
 }
 ```
 
-Idempotent on `eventId`. Unknown event ids are rejected with 404 so a bad workflow cannot invent history.
+Recipient mapping: `request.created` goes to the lender; `request.approved` and `request.declined` go to the borrower; `request.cancelled` goes to the lender; `loan.returned` goes to the lender. No email addresses, addresses, descriptions, images, or Clerk ids are included. A real delivery channel would resolve the address server-side at send time and add it to the provider call, not to the signed payload.
 
-`POST /n8n/automation-alert` (n8n to Convex, signed)
+### 9.4 Convex HTTP endpoints
 
-Used by the error workflow. Idempotent on `alertId` (the n8n execution id).
+All `/n8n/*` handlers are POST, signed, nonce-checked, body-limited, and hand-validated. Convex HTTP actions do not support Convex argument validators, so `convex/lib/validate.ts` performs explicit type, length, enum, and date checks. The body reader stops at 64 KiB using a streamed byte counter, and a `Content-Length` above the cap is rejected before reading. Failures return a code and never leak whether a row exists.
 
-`GET /health` (unsigned, minimal)
+**`POST /n8n/event-status`** (n8n to Convex)
 
-Returns `{ ok: true, now }`. Used by compose healthchecks and uptime monitors.
+```json
+{ "eventId": "uuid", "status": "delivered", "executionId": "n8n-exec-id", "error": "optional short text" }
+```
 
-All HTTP handlers return JSON with `{ error: { code, message } }` on failure and never echo secrets or stack traces.
+Updates the `automationEvent` with the matching `eventId`. Missing event returns 404. Repeated delivery is a no-op. `error` is omitted when absent; `null` is rejected so the optional Convex validator is satisfied. The handler never writes raw payloads into the event.
 
-### 9.5 Workflow 1: request notifications
+**`POST /n8n/overdue`** (n8n to Convex)
 
-`n8n/workflows/01-request-notifications.json`
+```json
+{ "asOf": "2026-11-03", "limit": 100 }
+```
 
-Nodes:
+`asOf` defaults to `boardToday`; `limit` defaults to 100 and is clamped and validated to 1..200. The handler calls `claimOverdueReminders` in one mutation:
 
-1. **Webhook** `POST /webhook/lendloop-requests`, raw body handling is not required because signing is canonical, respond only after processing.
-2. **Code: verify signature** reads `$env.N8N_OUTBOUND_SECRET`, rebuilds the canonical string from the parsed body, compares with `crypto.timingSafeEqual`, and throws on mismatch or stale timestamp.
-3. **Switch** on `eventType` to choose the notification copy for requested, approved, declined, cancelled, and returned.
-4. **Code: compose mock notification** builds a short message for the intended recipient and logs it with the event id. This is the mock channel. No third-party service is contacted.
-5. **HTTP Request: write-back** POSTs to `${CONVEX_SITE_URL}/n8n/automation-event`, signed with `N8N_INBOUND_SECRET`, body includes the same `eventId`.
-6. **Respond to Webhook** with 200 only if the write-back succeeded.
+- Query approved loans with `endDate < asOf`, ordered by `endDate`, `take(limit)`.
+- For each loan, `reminderKey = ${loanId}:${asOf}`.
+- If a reminder exists with status `sent`, skip.
+- If it exists with status `claimed` and `claimedAt > now - 30 minutes`, skip as in-flight.
+- Otherwise claim it: set `status: "claimed"`, a new `claimToken`, `claimedAt: now`, and `attemptedAt: now`.
+- If no reminder exists, insert a claimed row.
+- Return `{ claims: [{ loanId, reminderKey, claimToken, borrowerName, toolName, startDate, endDate, daysOverdue }] }`.
 
-Node retry settings: `retryOnFail: true`, `maxTries: 3`, `waitBetweenTries: 5000` on the write-back. Workflow error workflow is set to workflow 3.
+The response is signed. It contains names and dates only, no email addresses. Convex limits a transaction to 32,000 scanned documents; 200 reminders is far below that, and the limit is documented.
 
-Returning 200 only after the write-back means a write-back failure causes Convex to retry the whole event. The notification is a mock log, so duplicate logs on retry are acceptable and the timeline stays idempotent.
+**`POST /n8n/reminder-status`** (n8n to Convex)
 
-### 9.6 Workflow 2: overdue reminders
+```json
+{ "reminderKey": "loanId:2026-11-03", "claimToken": "uuid", "status": "sent", "sentAt": 1762300000000, "error": "optional" }
+```
 
-`n8n/workflows/02-overdue-reminders.json`
+Validates the key format and that the loan exists. It does not require the loan to still be approved: a loan can be returned between claim and write-back, and the notification status describes the reminder, not the loan's current state. Checks the claim token; a stale or mismatched token returns 409. Transitions are monotonic: `claimed` to `sent` or `failed`; `sent` is terminal; a later `failed` is recorded as an `automationEvent` and an alert but does not downgrade the reminder. Writes/updates the corresponding `automationEvent` with `eventId: "reminder:" + reminderKey`. A repeated `sent` is a no-op. `sentAt` is required only for `sent`; failed rows use `attemptedAt`.
 
-Nodes:
+**`POST /n8n/alert`** (n8n error workflow to Convex)
 
-1. **Schedule Trigger**: daily at 09:00 in `GENERIC_TIMEZONE`.
-2. **HTTP Request: fetch overdue** POST to `${CONVEX_SITE_URL}/n8n/overdue`, signed with `N8N_INBOUND_SECRET`.
-3. **IF: any loans** to exit cleanly when there is nothing to do.
-4. **Split In Batches**: batch size 10.
-5. **Code: compose mock reminder** builds the message from borrower, tool, due date, and days overdue.
-6. **HTTP Request: write status** POST to `${CONVEX_SITE_URL}/n8n/reminder-status`, signed, with the `reminderKey` from the fetch response.
-7. **Loop** until batches are exhausted.
+```json
+{ "alertId": "execution-id-or-fallback", "workflowName": "overdue-reminders", "executionId": "optional", "message": "short, PII-free" }
+```
 
-Retry settings on both HTTP nodes. Error workflow set to workflow 3. The reminder key is the idempotency boundary: a retried write updates the same row and never creates a second reminder record.
+Read-then-insert by `alertId`; duplicates are no-ops. `executionId` is optional because the Error Trigger omits it for some failures. The message is truncated to 500 characters and stripped of payload fields by the workflow before sending.
 
-### 9.7 Workflow 3: error handler
+**`GET /health`** is unsigned and returns `{ ok: true }`. It exposes no version, environment, or secret.
 
-`n8n/workflows/03-error-handler.json`
+### 9.5 Request notification workflow
 
-- **Error Trigger** fires for any workflow that names it as its error workflow.
-- **Code** builds `{ alertId: execution.id, workflowName, executionId, message }`.
-- **HTTP Request** POSTs to `${CONVEX_SITE_URL}/n8n/automation-alert`, signed, with retries.
-- The admin automation view lists these alerts so a failed run is visible inside LendLoop, not only in the n8n execution log.
+File: `workflows/request-notification.json`. Stable id `lendloop-request-notification`. `settings.errorWorkflow` points to `lendloop-error-handler`.
 
-### 9.8 n8n configuration and import
+1. **Webhook** `POST /webhook/lendloop-events`. Set `responseMode: "responseNode"`, not the default `onReceived`. This is load-bearing: with the default, Convex receives 200 before verification and write-back, and the retry guarantee is void.
+2. **Code: Verify HMAC.** Read `headers["x-lendloop-signature"]`, `x-lendloop-timestamp`, and `x-lendloop-nonce`. Build the canonical string from `POST`, `/webhook/lendloop-events`, and the parsed body. Use `crypto.createHmac("sha256", $env.CONVEX_TO_N8N_SECRET)` and a constant-time compare. Reject timestamps outside 300 seconds. On failure, route to a Respond node with 401; do not trigger the error workflow for unauthenticated traffic.
+3. **Switch** on `eventType`. All five event types share one endpoint.
+4. **Code: Compose message.** Use recipient name, tool name, dates, and status. No email.
+5. **Code: Log mock notification.** `console.log(JSON.stringify({ channel: "mock", eventId, recipient, message, sentAt }))`.
+6. **Code: Sign write-back.** Build the canonical string for `POST /n8n/event-status` with a fresh nonce and the `N8N_TO_CONVEX_SECRET`.
+7. **HTTP Request: Write status back.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/event-status` with signature headers and `{ eventId, status: "delivered", executionId: $execution.id }`. If it fails, the workflow fails, so the Respond node is not reached and Convex retries the outbox.
+8. **Respond to Webhook** `200 { "ok": true }`.
 
-Compose services:
+A successful response means the event was verified, logged, and written back. A response from the default "Workflow got started" mode would not.
 
-- `n8n` with Postgres, `N8N_ENCRYPTION_KEY`, `GENERIC_TIMEZONE`, `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` so Code nodes can read `$env`.
-- `n8n-import` one-shot service that runs `n8n import:workflow --separate --input=/workflows` and activates imported workflows.
-- Secrets are supplied by environment only. Exported JSON contains `$env.*` references, never literal secrets.
+### 9.6 Overdue reminders workflow
+
+File: `workflows/overdue-reminders.json`. Stable id `lendloop-overdue-reminders`. `settings.errorWorkflow` points to `lendloop-error-handler`. `settings.timezone` is cleared so `GENERIC_TIMEZONE` applies.
+
+1. **Schedule Trigger** daily at 09:00 in `GENERIC_TIMEZONE`. The schedule time only decides when the run starts; Convex computes `asOf` from the board date.
+2. **Code: Sign request.** Canonical string for `POST /n8n/overdue`, body `{ "limit": 100 }`, fresh nonce, `N8N_TO_CONVEX_SECRET`.
+3. **HTTP Request: Claim overdue reminders.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/overdue` with signature headers.
+4. **Code: Verify response HMAC.** Recompute the canonical string for `POST /n8n/overdue` from the response body and the response signature headers, using `CONVEX_TO_N8N_SECRET`. Reject on mismatch.
+5. **Loop Over Items** over `claims`.
+6. **Code: Log mock reminder.** Include `reminderKey`, borrower name, tool, dates, and `daysOverdue`.
+7. **Code: Sign reminder status.**
+8. **HTTP Request: Write reminder status.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/reminder-status` with `{ reminderKey, claimToken, status: "sent", sentAt }`. Set `onError: continueErrorOutput` so one failure does not abort the rest of the batch.
+9. **Error branch: Sign and write failed status.** POST `status: "failed"`, `error`, `attemptedAt`. If this also fails, let the execution fail so the error workflow alerts.
+
+An empty claims list ends the run without error. A claim whose write-back never lands expires after 30 minutes and is retried on the next run. This is at-least-once delivery with a dedupe key, which is the honest guarantee for a mock channel; a real provider would also receive the `reminderKey` as its idempotency key.
+
+### 9.7 Error workflow
+
+File: `workflows/error-handler.json`. Stable id `lendloop-error-handler`.
+
+1. **Error Trigger.**
+2. **Code: Build alert.** `alertId = $json.execution?.id ?? $execution.id ?? "fallback-" + Date.now()`. `workflowName` and `executionId` are optional. The message is truncated to 500 characters and contains no payload fields.
+3. **Code: Sign alert.** Canonical string for `POST /n8n/alert` with `N8N_TO_CONVEX_SECRET`.
+4. **HTTP Request: Write alert.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/alert`, `onError: continueErrorOutput`.
+5. **No-op terminal node.** n8n does not recursively run the error workflow for failures inside it, so a failed alert POST is logged but cannot be alerted. This is documented; the admin automation view also shows outbox failures, so the alerting path is not the only signal.
+
+The admin automation view lists unresolved alerts with a Resolve action, which writes `resolvedAt` and an audit row.
+
+### 9.8 n8n container configuration
+
+The image version is pinned in `.env.example` after the first smoke test. The README records the tested version. `latest` is never used.
+
+Required Postgres configuration (without these, n8n silently uses SQLite):
+
+```text
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=postgres
+DB_POSTGRESDB_PORT=5432
+DB_POSTGRESDB_DATABASE=n8n
+DB_POSTGRESDB_USER=n8n
+DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+```
+
+Postgres exposes `POSTGRES_DB=n8n`, `POSTGRES_USER=n8n`, and a healthcheck using `pg_isready`. n8n depends on Postgres being healthy. The importer depends on n8n being healthy.
+
+Other required settings:
+
+```text
+N8N_ENCRYPTION_KEY=<generated>
+NODE_FUNCTION_ALLOW_BUILTIN=crypto
+N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+N8N_SECURE_COOKIE=false
+N8N_USER_MANAGEMENT_DISABLED=true   # editor is localhost-only
+GENERIC_TIMEZONE=America/New_York   # set from the reviewer's region
+EXECUTIONS_DATA_PRUNE=true
+EXECUTIONS_DATA_MAX_AGE=24
+N8N_DIAGNOSTICS_ENABLED=false
+```
+
+With n8n 2.x, set the same `NODE_FUNCTION_ALLOW_BUILTIN` on the task runner service. If the pinned version requires owner setup, the importer waits for the owner to exist, or `N8N_USER_MANAGEMENT_DISABLED=true` is used for local-only access.
+
+**Import and activation.** `n8n import:workflow` deactivates imported workflows by default. The one-shot importer:
+
+1. Waits for `GET /healthz` to return 200, with a 60-second timeout.
+2. Imports each JSON file with `n8n import:workflow --input=<file>`.
+3. Activates them:
+   - n8n 1.x: `n8n update:workflow --all --active=true`.
+   - n8n 2.x: `n8n publish:workflow --id=<stable-id>` for each workflow.
+4. Verifies via `n8n list:workflow` that every workflow is active. Exits nonzero and prints a clear error if not.
+
+The importer is a one-shot service with `restart: "no"`. A cold start race is prevented by the health gates. Re-running `docker compose up n8n-import` is the documented fix for a failed import.
+
+**Stable ids and error linkage.** The three workflow JSON files contain stable `id` values, and workflows 1 and 2 set `settings.errorWorkflow` to the error workflow's id in the JSON, not only in the UI. After import, the importer exports the workflows and asserts the linkage; a UI-only fix would be overwritten on the next `docker compose up`.
+
+**Execution data.** Execution history stores node inputs and outputs, which can contain names and dates. Pruning is enabled with a 24-hour age. The mock log contains no email addresses. This is noted in `docs/security.md`.
 
 ## 10. Frontend design
 
-### 10.1 Design direction
+### 10.1 Visual language
 
-Minimal, warm, community-trustworthy. Not a generic SaaS dashboard.
+- Warm, minimal, neighborhood-scale. Off-white paper background, ink text, terracotta accent, sage for success, amber for overdue.
+- One display serif for the hero and page titles, one sans for UI. Fonts are self-hosted in `src/app/fonts/` with `next/font/local`, so the Docker build does not depend on Google Fonts network access. Open-license fonts only.
+- Generous spacing, a single accent, subtle borders, no gradient soup.
+- Tokens in `globals.css` as CSS variables; light mode only.
+- Components from 21st.dev are copied into `src/components/ui`, committed with their Radix dependencies in `package.json`. The reviewer does not need registry access.
 
-Tokens:
-
-- Canvas `#FAF8F4`, surface `#FFFFFF`, ink `#1F2621`.
-- Primary deep green `#2F6B4F`, secondary amber `#C98B3C`.
-- Muted text `#6B7268`, border `#E4DED3`, danger `#B4453C`.
-- Radius 14px for cards, 10px for controls.
-- Type: one sans for UI, one display face for the hero. Use `next/font`.
-- Generous whitespace, thin borders, almost no shadows.
-
-Implementation path:
-
-1. Invoke `/ui-ux-pro-max` at the start of the UI phase for layout, hierarchy, and polish guidance.
-2. Use the 21st.dev registry/MCP to fetch a small set of components (dialog, dropdown, tabs, toast, select). Adapt them to the tokens and copy them into `src/components/ui`.
-3. Do not add a heavyweight component library. Every copied component is readable and owned by the repo.
-4. Verify keyboard focus, contrast, and mobile layout before calling the UI done.
-
-### 10.2 Routes and experiences
+### 10.2 Routes
 
 **`/` public**
 
-- Nav with LendLoop wordmark and a "Sign in to lend or borrow" button.
-- Hero: tagline "Borrow what you need. Lend what you don't."
-- Category filter chips.
-- Grid of available tools showing name and category only.
-- Empty state when no tools are available.
-- A quiet note: "Owner details stay private until you sign in."
+- LendLoop name and tagline.
+- Clerk sign-in button.
+- Read-only grid of available tools showing name and category only.
+- Category filter. No owner, condition, or description.
 
 **`/browse` authenticated**
 
-- App shell with nav: Browse, My listings, My requests, Incoming, Admin (admins only).
-- Cards show name, category, condition, availability pill, owner name, trusted badge.
+- All active tools, with owner name, trusted badge, availability pill, and `nextAvailableDate`.
 - Category filter.
-- Request action on tools that are available or reserved and not owned by the caller.
-- Request dialog: start date, end date, optional message, inline validation.
+- Request action for any tool that is not the caller's and whose dates can be chosen without overlap.
+- The request dialog disables past dates and dates that overlap an approved loan, shows the conflict reason, and re-validates on submit. The UI never offers a range the server will reject for overlap.
 
-**`/listings`**
+**`/listings` authenticated**
 
-- Create listing form or dialog.
-- Cards with edit, remove, and a compact summary of pending and active loans.
-- Remove requires confirmation and explains that pending requests will be declined.
+- Caller's active and removed listings.
+- New listing, edit, remove with confirmation.
+- Removed listings are visually distinct and offer "Restore" only if restore is implemented; otherwise the README states removal is permanent from the user's perspective.
 
-**`/requests`**
+**`/requests` authenticated**
 
-- Requests the caller made, with status, tool, dates, lender, and cancel on pending.
-- Activity timeline, including automation events.
+- Requests the caller made, grouped by status.
+- Cancel on pending.
+- Mark returned on approved. This action is explicit here, not only on `/incoming`.
+- Loan detail drawer with the automation timeline.
 
-**`/incoming`**
+**`/incoming` authenticated**
 
-- Requests on the caller's tools, pending first.
-- Approve or decline with optional reason.
-- Approved loans have a "Mark returned" action.
+- Requests on the caller's tools.
+- Approve and decline on pending, with the overlap re-check surfaced as a toast if it fails.
+- Mark returned on approved.
+- Loan detail drawer with the timeline.
 
-**`/admin`**
+**`/admin` authenticated, admin only**
 
-- Tabs: Tools, Loans, Users, Automation.
+- Tabs: Tools, Loans, Automation.
 - Tools: remove any listing.
-- Loans: all loans with status and dates.
-- Users: list with role and trusted toggle.
-- Automation: outbox failures, alerts, recent events.
-- Every admin action writes an `auditLog` row.
+- Loans: read-only list of all loans, with parties, dates, status, and overdue flag.
+- Automation: outbox counts (`pending`, `sending`, `sent`, `failed`), failed rows with last error, unresolved alerts with a Resolve action. This is where failures become visible.
+- No edit action on other users' tools and no loan actions on others' loans.
 
-**Loan detail**
+**Loan detail and timeline**
 
-- Drawer or dialog reachable from request rows.
-- Timeline: requested, approved or declined, returned, reminders sent, with relative times like "Reminder sent 2 days ago". This is the bonus requirement.
+- Available from `/requests`, `/incoming`, and `/admin`.
+- Shows status, dates, parties, and a timeline of `automationEvents`, e.g., "Request notification delivered", "Reminder sent 2 days ago", "Reminder failed: timeout".
+- Seeded events are labeled "Demo event" so they are not confused with live automation.
 
-### 10.3 UX standards
+### 10.3 States
 
-- Loading skeletons, not spinners on blank screens.
-- Empty states with one clear action.
-- Toasts for success and failure, with the server's error code mapped to plain language.
-- Destructive actions always confirm.
-- Dates show as readable local dates, stored as `YYYY-MM-DD`.
-- Mobile: single column, bottom-safe action buttons, no horizontal scroll.
-- Accessibility: semantic landmarks, labeled inputs, visible focus rings, `aria-live` for toasts, contrast checked.
+- Loading skeletons for lists and the timeline.
+- Empty states for no tools, no requests, no incoming requests, and no alerts.
+- Error toasts mapped from Convex error codes: `UNAUTHENTICATED`, `EMAIL_UNVERIFIED`, `ACCOUNT_CONFLICT`, `VALIDATION`, `CONFLICT`, `NOT_FOUND`, `FORBIDDEN`, `RATE_LIMITED`.
+- A global offline or failed-mutation state that does not lose the user's form input.
 
-### 10.4 Client architecture
-
-- `ConvexProviderWithClerk` inside `ClerkProvider` at the root.
-- `useConvexAuth` drives loading, signed-out, and signed-in states.
-- The `(app)` layout guards for UX only. Convex functions are the real boundary. This is documented explicitly so the reviewer sees the reasoning.
-- Queries are scoped by the server, not by client-supplied ids.
-- `users.ensure` runs once after authentication via a small hook.
-
-## 11. Local setup and Docker
+## 11. Local setup
 
 ### 11.1 Environment variables
 
-| Variable | Where it lives | Purpose |
+Root `.env`, copied from `.env.example`. Never committed.
+
+| Variable | Where | Purpose |
 |---|---|---|
-| `NEXT_PUBLIC_CONVEX_URL` | root `.env`, build arg | Convex deployment URL |
-| `CONVEX_DEPLOYMENT` | root `.env` | Convex CLI target |
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | root `.env`, build arg | Clerk client |
-| `CLERK_JWT_ISSUER_DOMAIN` | Convex env | JWT verification in `auth.config.ts` |
-| `ADMIN_EMAILS` | Convex env | comma-separated admin bootstrap list |
-| `APP_BASE_URL` | Convex env | links in notification payloads |
-| `N8N_WEBHOOK_URL` | Convex env | public tunnel URL to n8n |
-| `N8N_OUTBOUND_SECRET` | Convex env and n8n env | sign Convex to n8n |
-| `N8N_INBOUND_SECRET` | Convex env and n8n env | sign n8n to Convex |
-| `CONVEX_SITE_URL` | n8n env | n8n write-back base URL |
-| `N8N_ENCRYPTION_KEY` | compose env | n8n credential encryption |
-| `POSTGRES_PASSWORD` | compose env | n8n database |
-| `GENERIC_TIMEZONE` | compose env | daily schedule |
-| `BOARD_TIMEZONE` | Convex env | defines "today" for validation and overdue |
-| `ALLOW_SEED` | Convex env | gates the seed function |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Next app build and runtime | Clerk |
+| `CLERK_SECRET_KEY` | Next app runtime | Clerk server-side auth and middleware |
+| `CLERK_JWT_ISSUER_DOMAIN` | Convex env | Clerk JWT verification |
+| `NEXT_PUBLIC_CONVEX_URL` | Next app build time | Convex deployment URL; inlined by Next |
+| `CONVEX_DEPLOYMENT` | root `.env` | Written by `convex dev`, not hand-edited |
+| `ADMIN_EMAILS` | Convex env | comma-separated verified admin emails |
+| `BOARD_UTC_OFFSET_MINUTES` | Convex env | board date offset, default `0` |
+| `CONVEX_TO_N8N_SECRET` | Convex env and n8n env | Convex signs, n8n verifies |
+| `N8N_TO_CONVEX_SECRET` | Convex env and n8n env | n8n signs, Convex verifies |
+| `CONVEX_TO_N8N_SECRET_PREVIOUS` | both, optional | rotation window |
+| `N8N_TO_CONVEX_SECRET_PREVIOUS` | both, optional | rotation window |
+| `N8N_WEBHOOK_URL` | Convex env | full URL, including `/webhook/lendloop-events` |
+| `CONVEX_SITE_URL` | n8n env | `https://<deployment>.convex.site`, set by the setup script |
+| `APP_BASE_URL` | Convex env | `http://localhost:3000` for links in payloads |
+| `ALLOW_SEED` | Convex env | second guard on the internal seed mutation |
+| `N8N_ENCRYPTION_KEY` | n8n env | n8n credential encryption |
+| `POSTGRES_PASSWORD` | compose | Postgres |
+| `N8N_IMAGE` | compose | pinned n8n image |
+| `GENERIC_TIMEZONE` | n8n env | schedule timezone |
+| `N8N_SECURE_COOKIE` | n8n env | `false` for local HTTP |
+| `CLOUDFLARED_IMAGE` | compose | pinned cloudflared image |
 
-`.env.example` contains every key with safe placeholder values. `.gitignore` excludes `.env`, `.env.local`, `.convex`, `n8n_data`, and `node_modules`.
+`.env.example` documents each value, including that `N8N_WEBHOOK_URL` is the full webhook URL and that `NEXT_PUBLIC_CONVEX_URL` is build-time.
 
-### 11.2 Compose stack
+### 11.2 Docker Compose services
 
-- `app`: production Next.js standalone build on port 3000. Public env vars passed as build args because Next inlines `NEXT_PUBLIC_*` at build time.
-- `n8n`: port 5678, Postgres database, workflows mounted read-only.
-- `postgres`: named volume.
-- `cloudflared`: quick tunnel to `http://n8n:5678`, public URL parsed from logs.
-- `n8n-import`: one-shot import and activation.
-- Healthchecks on app and n8n.
+- `postgres`: Postgres 16, named volume, `pg_isready` healthcheck.
+- `n8n`: pinned image, depends on Postgres healthy, binds `127.0.0.1:5678:5678`, full `DB_*` config, crypto allowlist, execution pruning.
+- `n8n-import`: one-shot, depends on n8n healthy, imports and activates, verifies active state, exits.
+- `proxy`: nginx, listens on 8080, forwards only `/webhook/*` and `/webhook-test/*` to n8n, returns 404 for everything else.
+- `cloudflared`: quick tunnel to `http://proxy:8080`, no account required.
+- `app`: Next.js standalone image. `NEXT_PUBLIC_CONVEX_URL` is a build arg, so the image is built after the Convex deployment is known. The setup script rebuilds when the value changes.
+
+The compose file is valid without the app for the n8n-only smoke test, and `docker compose config` runs in CI.
 
 ### 11.3 Setup script
 
-`npm run setup` performs:
+`npm run setup` runs `scripts/setup.mjs`, which is idempotent:
 
-1. Validate required keys in `.env`.
-2. Push the schema and functions with `npx convex dev --once` or `npx convex deploy`.
-3. Set Convex environment variables from `.env`.
-4. Start the compose stack.
-5. Wait for the cloudflared URL and set `N8N_WEBHOOK_URL` on the Convex deployment.
-6. Print the app URL, the n8n URL, and the seed command.
+1. Validate `.env`. Fail with a named missing key, not a stack trace.
+2. `npx convex dev --once`. This links or creates the deployment and writes `CONVEX_DEPLOYMENT` and the deployment URL. Do not hand-write `CONVEX_DEPLOYMENT`.
+3. Read the deployment URL and site URL. Set Convex env vars with `npx convex env set` after the deployment is linked: `ADMIN_EMAILS`, `BOARD_UTC_OFFSET_MINUTES`, `CLERK_JWT_ISSUER_DOMAIN`, both secrets, `APP_BASE_URL`, and `ALLOW_SEED=true`. Write `CONVEX_SITE_URL` to `.env.local` for the n8n containers. `N8N_WEBHOOK_URL` waits for the tunnel.
+4. `docker compose up -d postgres n8n`, wait for both healthchecks.
+5. Start `cloudflared`, read the tunnel URL from its logs with a 60-second timeout. Fail loudly if it is not found. Write the full `N8N_WEBHOOK_URL=<tunnel>/webhook/lendloop-events` to `.env.local` and set it on Convex.
+6. `docker compose up -d n8n-import proxy`. The importer waits for n8n health, imports, activates, and verifies.
+7. `docker compose build app`, then `docker compose up -d app`. The build happens after `NEXT_PUBLIC_CONVEX_URL` is known.
+8. Run the seed: `npx convex run seed:run '{"adminEmail":"<first ADMIN_EMAILS>"}'`. The seed is an internal mutation.
+9. Print the app URL, the admin email, the tunnel URL, and the next steps.
 
-A separate `npm run dev` path runs Convex and Next in watch mode for development. Both paths are documented. The README is honest that Clerk and Convex require free accounts; the phrase "one command" refers to the Docker stack after those keys exist.
+`npm run tunnel:sync` re-reads a restarted tunnel and updates `N8N_WEBHOOK_URL` on Convex without rebuilding the app. The README tells the reviewer to run it after a Docker restart, since the quick tunnel URL changes.
+
+`npm run seed` wraps the internal mutation and accepts an optional email. Re-running resets only unadopted seed rows (`clerkId` beginning with `seed:`) and recreates them for the current admin email. It never deletes data owned by a real Clerk user.
 
 ### 11.4 Reviewer quick start
 
-Because the company runs the repo themselves, the setup path is a deliverable, not an afterthought. The README opens with:
+The README opens with this path:
 
 1. Prerequisites: Node 20+, Docker Desktop, free Clerk and Convex accounts.
-2. A five-step account setup: create a Clerk app, create the `convex` JWT template, run `npx convex login`, set the six required keys in `.env`, and set `ADMIN_EMAILS`.
-3. `npm run setup`, then `npm run seed`, then open `http://localhost:3000`.
-4. Expected output at each step, including the tunnel URL line and the seeded credentials note.
-5. A troubleshooting table for the five failures most likely on Windows and macOS: Convex not linked, Clerk JWT template missing or misnamed, tunnel not ready, n8n import not finished, and port already in use.
+2. `cp .env.example .env`, then fill the Clerk publishable key, secret key, and issuer domain.
+3. In Clerk:
+   - Enable email verification.
+   - Create a JWT template named `convex` with claims:
+     `{ "email": "{{user.primary_email_address}}", "email_verified": "{{user.email_verified}}", "name": "{{user.full_name}}", "picture": "{{user.image_url}}" }`
+     The standard claim is `email_verified`; Convex exposes it to `getUserIdentity()` as `emailVerified`.
+4. In `.env`, set `ADMIN_EMAILS` to the reviewer's own Clerk email and `BOARD_UTC_OFFSET_MINUTES` to their local offset (for example `-300` for US Eastern).
+5. `npm install`, `npx convex login`, `npm run setup`, `npm run seed`, open `http://localhost:3000`.
+6. Sign in with the `ADMIN_EMAILS` address. The seeded placeholder is adopted, and Incoming, My requests, and Admin are populated.
+7. If `ADMIN_EMAILS` changes, run `npm run seed` again and sign in with the new address.
 
-The README also contains screenshots of every view and a two-minute reviewer walkthrough, so a reviewer can evaluate the UX without running anything. Screenshots are taken from the seeded admin account, which shows the populated two-sided flow.
+The README includes screenshots of every route and a two-minute walkthrough, so a reviewer can evaluate the UX without running anything. Screenshots are taken from the seeded admin account and labeled as demo data.
 
 ### 11.5 Seed data
 
-`npm run seed` creates:
+`convex/seed.ts` exports only an `internalMutation`, run through `npx convex run` by an operator. It is not callable by clients. `ALLOW_SEED=true` is a second guard.
 
-- A placeholder user for each address in `ADMIN_EMAILS`, with `clerkId: "seed:<email>"`.
-- Four fictional neighbors.
-- Eight tools across power, garden, kitchen, camping, and hand tools.
-- Three loans tied to the first admin address: a pending incoming request on an admin-owned tool, an approved overdue loan on an admin-owned tool, and a pending request from the admin to a fictional neighbor.
+`seed.run({ adminEmail })`:
 
-When the real admin signs in for the first time, `users.ensure` matches the placeholder by email from the verified Clerk JWT, replaces the placeholder `clerkId` with the real Clerk subject, and keeps all seeded tools and loans. The admin therefore lands on populated "Incoming", "My requests", and "Admin" views, and the overdue timeline has content. A second real account can test the borrower side of the two-sided flow. Adoption is safe because Clerk verifies email ownership before the JWT is issued.
+- Upserts a placeholder user for `adminEmail` with `clerkId: "seed:<email>"` and `role: "admin"`.
+- Upserts four fictional neighbors.
+- Upserts eight tools across power, garden, kitchen, camping, and hand tools, each with a `seedKey`.
+- Upserts four loans tied to the admin, each with a `seedKey`:
+  1. A pending incoming request on an admin-owned tool, from a fictional borrower.
+  2. An approved overdue loan on an admin-owned tool, borrowed by a fictional user.
+  3. An approved, not-yet-due loan on an admin-owned tool, so the admin can mark it returned.
+  4. A pending request from the admin to a fictional neighbor's tool, so "My requests" is populated.
+- Upserts `automationEvents` for the demo loans: a delivered request notification for the pending incoming request, a delivered reminder for the overdue loan, and a queued event for the admin's pending request. Each is labeled `Demo event` in the detail so it is not mistaken for a live run.
+- Uses deterministic keys and read-then-insert checks. Re-running is safe.
+- Fixture dates are computed relative to `boardToday`, never hardcoded, so the seed does not go stale.
 
-Seed is idempotent via deterministic keys and refuses to run unless `ALLOW_SEED=true`. It targets development deployments only. Fixture dates are computed relative to the board's today, never hardcoded, so the seed does not go stale.
+Adoption is safe because the seed only adopts a verified Clerk email, and a placeholder is only adopted once. A second user claiming the same email gets `ACCOUNT_CONFLICT`.
 
 ### 11.6 Human steps that cannot be automated
 
-These are sequenced at the start of the build so they do not strand the integration phase later:
+These are sequenced into Phase 0 and budgeted:
 
-- `npx convex login` and the first deployment selection are browser-based.
-- Creating the Clerk `convex` JWT template is a dashboard action.
-- `ADMIN_EMAILS` needs the real address that will own the admin experience.
-- The 21st.dev registry needs a login or API key before components can be fetched.
-- The GitHub repository must be created under the intended account. The current `gh` session belongs to `Noor-e-Bilal`, which must be confirmed before any push.
+- `npx convex login` and the first deployment selection are browser-based. Convex is already logged in on this machine.
+- Creating the Clerk `convex` JWT template and enabling email verification are dashboard actions.
+- `ADMIN_EMAILS` needs the reviewer's verified address.
+- 21st.dev components are fetched during the build with the connected registry; the copied files are committed, so the reviewer never needs access.
+- The GitHub repo is `Noor-e-Bilal/lendloop`, confirmed before the first push.
 
 ## 12. Security design
 
@@ -800,181 +921,209 @@ These are sequenced at the start of the build so they do not strand the integrat
 
 | Threat | Mitigation |
 |---|---|
-| Client calls a mutation with someone else's id | Identity is derived from the verified Clerk JWT, never from arguments. Ownership checked in the mutation. |
-| Client hides an admin-only button and still calls the API | Role read from the Convex user row and checked in every admin function. |
-| Public page leaks owner details | Public query returns an explicit projection of name and category only. |
-| Forged webhook call | HMAC-SHA256 over a canonical payload, separate secrets per direction, constant-time compare, 300 second timestamp window. |
-| Replayed webhook | Timestamp window plus idempotency keys on every write. Replays are no-ops returning 200. |
-| Secret leak through repo or workflow JSON | Secrets only in env and n8n credentials. `.gitignore` covers `.env`. Exported JSON uses `$env` references. |
-| Duplicate reminders after a retry | `reminderKey` is unique per loan per day. Write-back is insert-or-update. |
-| Double booking a tool | Overlap validation at request time and again at approval time. |
-| Notification silently lost | Transactional outbox, scheduler retries with backoff, cron sweep, admin-visible failure state, n8n error workflow. |
-| Abuse and spam | Length limits, listing and pending request caps, server-side validation. |
-| PII spread through automation | Payloads carry only one recipient, one actor, tool name, dates, and status. No addresses, images, descriptions, or Clerk ids. |
-| Admin lockout | Admin promotion is additive from `ADMIN_EMAILS`; demotion is not automatic. |
+| Broken access control | Server-side RBAC in every Convex function and HTTP handler. Read scoping for tools, loans, and timelines. `NOT_FOUND` for non-parties. Tests per matrix row. |
+| Spoofed or tampered webhook | HMAC-SHA256 over method, path, timestamp, nonce, and canonical JSON. Constant-time compare. 300-second window. Nonce replay cache. Separate secrets per direction. |
+| Replayed webhook | Nonce cache plus timestamp window. Idempotency keys on writes. Duplicate delivery is a no-op. |
+| Secret leak through repo or workflow JSON | Secrets only in `.env` and `n8n` env; workflow JSON uses `$env` references. `.gitignore` excludes `.env`. `verify-workflows.mjs` scans JSON for secret-shaped strings. |
+| Tunnel exposes the automation editor | The tunnel targets nginx, which forwards only `/webhook/*`. The n8n editor binds to localhost. |
+| Unverified email privilege escalation | `users.ensure` requires `email_verified` and a verified claim before admin promotion or seed adoption. Clerk email verification is required in setup. |
+| Seed takeover | Seed is internal-only, gated by `ALLOW_SEED`, adopts one verified email once, and rejects a second claimant. |
+| Duplicate notifications | Atomic outbox claim, token-checked completion, stale-lease sweep. |
+| Duplicate reminders | Claim-then-send with a 30-minute lease and a per-day `reminderKey`. At-least-once with a dedupe key. |
+| Notification silently lost | Outbox retries with backoff, admin alerts at attempt 3, failed rows visible in the admin view, stale `sending` sweep. |
+| PII spread through automation | Payloads carry names and dates only, no email, address, description, or Clerk id. Logs omit PII. n8n execution data is pruned. |
+| Admin lockout | Promotion is additive from `ADMIN_EMAILS`. Demotion is an audited internal mutation, not automatic. The README documents both. |
+| Abuse and spam | Server-side validation, per-tool pending cap, total pending cap, active-listing cap, bounded list queries. Edge rate limiting is a documented production item. |
+| Malformed or oversized request | Hand-written validation, enum and length checks, 64 KiB body cap, 404 on invalid paths. |
 
-### 12.2 Input validation
+### 12.2 Authorization and input validation
 
-All inputs use Convex validators plus semantic checks in `convex/lib/validators.ts`:
+- Queries and mutations use `requireUser` or `requireAdmin` plus ownership helpers.
+- HTTP actions use `requireSignature` and are explicitly excluded from the Clerk wrapper.
+- Every HTTP body is validated by hand: required fields, types, string lengths, enums, date format, numeric bounds, and unknown-field tolerance.
+- Private resources return `NOT_FOUND` for both missing and unauthorized rows. `FORBIDDEN` is used only when the resource is public and the role is insufficient.
+- The body reader enforces a 64 KiB limit and rejects an oversized `Content-Length` before reading.
+- `limit` on `/n8n/overdue` is validated to 1..200 with a default of 100.
+- Error responses use stable codes and no stack traces or row existence hints.
 
-- Name 2 to 80 characters, trimmed.
-- Description 10 to 600 characters, trimmed.
-- Message 0 to 400 characters.
-- Category and condition from fixed unions.
-- Date format, ordering, range, and not in the past.
-- Malformed or oversized input returns `VALIDATION` with a safe message.
+### 12.3 Secrets
 
-### 12.3 Secrets and operational safety
+- `.env` is gitignored. `.env.example` contains placeholders only.
+- Secrets are injected into compose from the environment, not baked into images.
+- Workflow JSON contains `$env` references only.
+- Logs never include secrets, signatures, full payloads, or email addresses.
+- `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` is required for the HMAC Code nodes. The blast radius is constrained by the localhost-only editor and the path-filtering tunnel. This is stated in `docs/security.md`.
+- Rotation uses the `_PREVIOUS` dual-secret window described in 9.2.
 
-- Two distinct HMAC secrets, never reused for another purpose.
-- No secret is logged. Errors log event ids and status codes only.
-- n8n's encryption key is generated for local use and never committed.
-- The README documents rotation: set a new secret in both places, allow the old one for one deploy if needed.
-- Admin bootstrap uses email matching from the verified JWT, not a client-supplied flag.
+### 12.4 Audit
 
-### 12.4 Audit trail
+- Audited writes: admin removal of a listing, trusted-lender changes, admin promotion, admin demotion, alert resolution.
+- Reads are not audited. The admin loans view is authorized, not audited.
+- `auditLog` is append-only by application convention. No mutation exposes update or delete. A test asserts that the public mutation surface contains no `auditLog` update or delete.
+- The audit row records actor, action, target type, target id, and a short detail. It does not store payloads or PII.
 
-Admin removal and trusted lender changes write `auditLog` rows with actor, action, and target. Reads are not audited: Convex queries are read-only, and a mutation fired on page load to record a view is a write-on-read pattern that adds noise without improving security. The admin loans view is authorized, not audited. The audit log is append-only in application code.
+### 12.5 Observability
 
-The audit model is described in `docs/security.md` with the language of a compliance-adjacent system: who did what, to which record, when, and through which interface. Loan state changes are reconstructable from `loans`, `automationEvents`, and `auditLog`. Payloads intentionally exclude free-text descriptions and addresses, so the audit trail itself stays low-PII.
-
-### 12.5 Observability and logging
-
-- Convex functions log structured events with `{ event, eventId, loanId, outcome }`. No secrets, no full payloads, no email addresses in log messages.
-- Every outbound attempt logs the outbox id, attempt number, HTTP status, and a short error category.
-- HTTP actions log the signature result and the idempotency outcome, which makes forged or replayed requests visible without logging the signature itself.
-- The admin automation view exposes queue depth, failure count, alerts, and the last error per row.
-- `GET /health` gives the compose healthcheck and any uptime monitor a cheap liveness signal.
-- The production note maps these signals to CloudWatch, Datadog, and Sentry, since the job description names them.
+- Convex functions log structured events with `{ event, eventId, loanId, outcome }`. No secrets, no full payloads, no email addresses.
+- Outbox dispatch logs the outbox id, attempt number, HTTP status, and a short error category.
+- HTTP handlers log the signature result and idempotency outcome, never the signature.
+- The admin automation view exposes queue depth, `sending` count, failures, unresolved alerts, and the last error per row.
+- `GET /health` is a cheap liveness signal for compose and an uptime monitor.
+- The production note maps these signals to CloudWatch, Datadog, and Sentry, which the role description names.
 
 ## 13. Testing
 
-`convex-test` plus Vitest, no deployment required.
+`convex-test` covers queries, mutations, and HTTP actions. Auth helpers mock `ctx.auth.getUserIdentity`. The test suite is the evidence for the security and reliability claims.
 
-Must-have suites:
+1. **RBAC**: non-owner edit and remove denied; admin cannot edit; admin can remove; admin cannot act on others' loans; non-party cannot read loan detail or timeline; public projection shape; removed tools hidden.
+2. **Lifecycle**: pending to approved to returned; invalid transitions; expired pending cannot be approved; approval re-checks overlap, tool status, and dates; cancel only by borrower; mark returned by either party.
+3. **Validation**: date predicate, one-day grace, 60-day cap, own-tool request, overlap, caps, enums, lengths.
+4. **Signing**: canonical JSON vector; valid signature passes; tampered body fails; stale timestamp fails; wrong secret fails; method or path mismatch fails; missing headers fail; body over 64 KiB fails. These tests call the HTTP handlers, not only the helper.
+5. **Idempotency**: two concurrent outbox claims, one wins; stale `sending` lease is reclaimed; a swept dispatcher cannot mark sent; duplicate `event-status` is a no-op; reminder claim is skipped while leased; stale claim is reclaimed; reminder status never downgrades `sent`; replayed nonce is rejected.
+6. **Seed adoption**: verified email adopts a placeholder; unverified email is rejected; a second claimant gets `ACCOUNT_CONFLICT`; admin promotion requires a verified email; demotion is audited.
+7. **Public list**: only `{ _id, name, category }`, only available tools, bounded to 60.
+8. **HTTP validation**: malformed JSON, missing fields, wrong types, invalid dates, `limit` bounds, unknown endpoint.
 
-1. **RBAC**: a user cannot edit or remove another user's tool, cannot approve another user's incoming request, cannot list all loans; an admin can remove any tool and toggle trusted status.
-2. **Lifecycle**: pending to approved, declined, cancelled, returned; invalid transitions throw `INVALID_STATE`; approve re-checks overlap.
-3. **Validation**: own-tool request, past dates, reversed range, over 60 days, overlapping approved loan, removed tool, and the one-day board timezone grace.
-4. **Idempotency**: record the same reminder twice and get one row; replay an automation event and get one timeline entry.
-5. **Signing**: canonical JSON vector, valid signature passes, tampered body fails, stale timestamp fails, wrong secret fails.
-6. **Overdue query**: only approved loans past `endDate`, excludes returned and pending, excludes loans reminded today.
-7. **Outbox**: success marks sent, failure schedules a retry, exhausted attempts mark failed and alert.
-8. **Seed adoption**: `users.ensure` matches a seeded placeholder by email, replaces its Clerk id, and preserves role, tools, and loans.
+**Workflow verification** (`scripts/verify-workflows.mjs`, run in CI):
 
-CI runs install, lint, typecheck, and test on push. A production build runs with placeholder public env values.
+- Parses each workflow JSON and asserts stable ids, `settings.errorWorkflow` linkage, and `responseMode: "responseNode"` on the request webhook.
+- Extracts the canonicalizer from the Code node and runs it against the same vectors as the TypeScript helper, so the two implementations cannot drift.
+- Asserts no literal secret-shaped strings and no `latest` image tag in compose.
+- Runs `docker compose config` to validate the stack.
 
-## 14. Documentation deliverables
+**CI** runs install, lint, typecheck, test, workflow verification, and compose config on push. It does not run Docker builds, which are slow and environment-dependent. A manual smoke checklist covers the compose stack and the two live workflows.
 
-**README.md**
+**No Playwright.** The checked-in walkthrough covers the reviewer path, and the HTTP handler tests cover the security boundary. This is stated as a trade-off in the README.
 
-- What LendLoop is, with screenshots of every view.
-- A two-minute reviewer walkthrough using the seeded admin account.
-- Quick start with prerequisites, free account setup, and the Docker path.
-- Troubleshooting table for the five most likely setup failures.
-- Architecture diagram and a walkthrough of the request and overdue flows.
-- Data model and lifecycle.
-- RBAC matrix.
-- Automation and signing summary.
-- Security decisions, auditability, privacy, and data minimization.
-- Observability and failure visibility.
-- Testing.
-- Project structure.
-- Deliverables mapped to the brief's five evaluation axes.
-- A short mapping to the role's themes: secure auth and RBAC, privacy and auditability, observability, API integration, automation, and documentation.
-- "What I would change for production", including an AWS deployment shape.
+## 14. Documentation
 
-**docs/**
+- `README.md`: what LendLoop is, screenshots, reviewer quick start, troubleshooting table, architecture summary, data model, RBAC, automation and signing summary, security and privacy notes, observability, testing, structure, brief mapping, and a link to the design document.
+- `docs/architecture.md`: diagrams and flow narratives.
+- `docs/security.md`: threat model, RBAC, audit, data minimization, secrets, rotation, and the n8n env-access trade-off.
+- `docs/n8n-integration.md`: payload schemas, canonical signing format, test vectors, workflow node lists, import and activation commands, and failure behavior.
+- `docs/production.md`: the reasoned production write-up and AWS mapping.
+- `docs/walkthrough.md`: the two-minute reviewer script with expected results.
+- `docs/images/`: screenshots, captured from the seeded admin account and labeled as demo data.
 
-- `architecture.md`: deeper component and data-flow notes.
-- `security.md`: threat model, authorization model, secret handling, data minimization.
-- `n8n-integration.md`: endpoint contracts, canonical signing with test vectors, idempotency, retry and error behavior, how to import workflows.
-- `decisions.md`: short ADR-style entries for the choices a reviewer might question (logged mock, soft delete, snapshot fields, derived overdue, outbox, cloud Convex plus tunnel).
-- `production.md`: the production note.
+The design document in `docs/superpowers/specs/` is kept as the design baseline. `docs/architecture.md` and the README link to it rather than restating every decision. If a decision changes during the build, the change is recorded in the README's decision notes and the design document is updated; there is no second decision log to drift.
 
-## 15. What would change for production
+The README's troubleshooting table covers: Convex not linked, Clerk JWT template missing claims, unverified email, tunnel URL missing or changed, n8n import inactive, Postgres not ready, port already in use, and app built with a stale Convex URL.
 
-- Run Convex in a production deployment with backups, and Clerk in a production instance with a custom domain.
-- Host n8n in queue mode with Postgres and Redis, pinned versions, and credentials for real email or chat delivery.
-- Replace the quick tunnel with a stable ingress, mTLS or network allowlisting, and rotate secrets on a schedule.
-- Replace or extend the outbox with a durable queue and dead-letter queue, with SLOs and alerting.
-- Use a claim-then-send reminder flow so a crash between send and write-back cannot produce duplicate reminders.
-- Add rate limiting and bot protection at the edge.
-- Add observability: structured logs, traces, metrics, and alerts on outbox depth and n8n failures.
-- Add end-to-end tests and contract tests between Convex and n8n.
-- Add data retention and deletion policy for loans and automation payloads.
-- Add moderation and abuse reporting for public listings.
-- Add real timezone handling per user instead of one board timezone.
-- Add image storage with signed URLs and content moderation if photos are introduced.
-- Map the current services to AWS for a production deployment: ECS or Fargate for the Next.js app, RDS or DynamoDB for relational data if Convex is not retained, API Gateway in front of HTTP actions, Cognito or Clerk for identity, S3 and CloudFront for assets, and CloudWatch for logs and metrics. Convex can stay as the data platform, which is the bonus the brief calls out.
-- Add Datadog APM and Sentry error reporting, with release tagging and alert routing.
-- Add a durable queue with a dead-letter queue and SLOs on automation latency.
+## 15. Production changes
 
-## 16. Build order for the 24 hours
+This section is deliberately short and reasoned. It answers "what would change if this were real," not "list every service we could buy."
+
+**Identity.** Keep Clerk, or move to Cognito if the rest of the stack is AWS. Either way, verify email at the identity provider, keep role assignment server-side, and add SSO and MFA for admins. Add a demotion and offboarding runbook with audit records.
+
+**Data.** Convex is a good fit for a 24-hour product and is the BaaS bonus the role description calls out. For a regulated deployment, document data residency, retention, and deletion. If Convex is not retained, the relational shape maps to RDS Postgres; the loan and reminder tables are the core. Do not split relational data across RDS and DynamoDB without a access-pattern reason. Encrypt at rest and in transit, and keep PII out of automation payloads and logs.
+
+**Automation.** The claim-then-send reminder flow is implemented here because it is a correctness requirement, not a production nicety. For a real channel, pass `reminderKey` as the provider idempotency key, add a dead-letter queue for exhausted outbox rows, and add SLOs for notification latency. Run n8n in queue mode with workers on ECS, RDS Postgres, secrets from AWS Secrets Manager, no public editor, and execution pruning. Acknowledge alerts and route them to an on-call channel.
+
+**Observability.** Ship structured logs to CloudWatch, traces and metrics to Datadog, and errors to Sentry with release tags. Alert on outbox depth, failed attempts, unresolved alerts, and reminder lag. Add synthetic checks on `/health` and on the webhook handshake.
+
+**Deployment shape.** Next.js on ECS or Fargate behind CloudFront and an ALB, or Vercel. API Gateway in front of HTTP actions if the app moves off Convex. S3 and CloudFront for images when they exist. WAF and rate limiting at the edge. Secrets Manager with rotation. Blue/green deploys and migrations reviewed like code.
+
+**Security.** Add edge rate limiting, bot protection, and a Content Security Policy. Rotate secrets on a schedule with the dual-secret window. Review dependency and container images. Add a threat-model review for any new PII field.
+
+**What is intentionally not here.** AI features, image uploads, chat, and payments are out of scope. Adding them would change the data model and the threat model, and the brief does not ask for them.
+
+## 16. Build order
+
+The estimates assume a clean start, the human steps in Phase 0, and a 24-hour window. The plan is 22 hours of work plus a 2-hour buffer. The n8n stack is proven before UI polish, because it is the most failure-prone phase.
 
 | Phase | Work | Estimate |
 |---|---|---|
-| 0 | Scaffold Next.js, Convex, Clerk, Tailwind, base tokens, env files | 2h |
-| 1 | Schema, auth sync, RBAC helpers, tools and loans mutations, tests | 5h |
-| 2 | Public page, app shell, browse, filters, request dialog | 4h |
-| 3 | Listings, requests, incoming, admin, timelines | 4h |
-| 4 | Outbox, signed HTTP endpoints, three n8n workflows, docker-compose | 4h |
-| 5 | Seed, setup script, tunnel link, manual end-to-end verification | 2h |
-| 6 | README, docs, screenshots, reviewer walkthrough, troubleshooting table, CI, final review | 3h |
+| 0 | Accounts, Clerk JWT template and email verification, Convex link, repo scaffold, dependencies, tokens, fonts, CI skeleton, and a one-hour n8n smoke test (compose, import a trivial workflow, activate, call it from Convex) | 3h |
+| 1 | Schema, auth and `users.ensure`, seed adoption, RBAC helpers, tools and loans mutations and queries, outbox enqueue, tests | 5h |
+| 2 | HMAC and canonical JSON, nonce cache, HTTP endpoints with validation and body limits, outbox claim, lease, sweep, retries, tests | 3.5h |
+| 3 | n8n workflows: request, overdue, error; activation and verification; response signing; canonicalizer parity; end-to-end smoke | 4.5h |
+| 4 | UI routes, components, request dialog with conflict prevention, timeline, admin tabs, empty and loading states | 3.5h |
+| 5 | Setup script, compose, proxy, tunnel, seed reset behavior, reviewer quick start, manual end-to-end verification | 2.5h |
+| 6 | README, docs, screenshots, walkthrough, workflow verification, CI, final review | 2h |
+| Buffer | Unplanned framework or environment issues | 2h |
 
-Buffer: 1 hour. If time runs short, cut admin audit screen polish, then the optional deployment. Do not cut tests, signing, idempotency, or documentation.
+**Cut list, in order**, if the clock runs out:
+
+1. Admin automation tab polish. Keep the data visible; drop the styling.
+2. `nextAvailableDate` on browse. Keep the availability pill.
+3. Screenshots from every route to six representative screens.
+4. The production note's AWS detail. Keep the reasoning, shorten the mapping.
+
+**Never cut:** server-side RBAC, signature verification, idempotent write-backs, retries, the error workflow, the reviewer quick start, or the troubleshooting table. Those are the axes the brief grades.
 
 ## 17. Builder freedom
 
-These are left to the builder as implementation calls:
+These are explicitly the builder's call and should not trigger another design review:
 
-- Exact Tailwind token names and component file breakdown.
-- Whether the request dialog is a dialog or a dedicated route.
-- Whether the activity timeline is a drawer or an inline expandable row.
-- Exact copy and empty state illustrations.
-- Whether the setup script is Node or shell, as long as one documented command works on Windows and macOS.
-- Exact retry backoff constants within the stated ranges.
-- Whether `users.ensure` is a mutation called by a hook or an action wrapper.
+- Exact component composition and spacing within the tokens.
+- Whether the request form is a dialog or a dedicated route, as long as it is deep-linkable from a notification payload.
+- Whether the timeline is a drawer or an inline expandable row, as long as it is visible without an extra page load.
+- Exact backoff constants within the stated order of magnitude.
+- Test file organization.
+- Copywriting and empty-state text.
 
-## 18. Acceptance checklist mapped to the brief
+Everything else in this document is a requirement, not a suggestion.
 
-**Public page**
+## 18. Acceptance checklist
 
-- [ ] LendLoop name and tagline.
-- [ ] Available tools with name and category only.
-- [ ] Sign in button wired to Clerk.
-- [ ] No owner details in the payload or the UI.
+**Functional**
 
-**Authenticated experience**
+- [ ] Public page shows LendLoop, the tagline, a sign-in button, and available tools with name and category only.
+- [ ] Authenticated users can create, edit, and remove their own listings.
+- [ ] Authenticated users can request a tool for a valid date range, and overlapping ranges are prevented in the UI and rejected on the server.
+- [ ] Lenders can approve or decline pending requests on their tools.
+- [ ] Lenders and borrowers can mark an approved loan returned.
+- [ ] Browse shows all active tools with availability and category filtering.
+- [ ] My listings, My requests, and Incoming requests are populated.
+- [ ] Admin can remove any listing, view all loans, and mark or unmark a trusted lender.
+- [ ] Each loan shows a recent automation activity timeline, with seeded events labeled as demo data.
+- [ ] Pending requests expire when their date range passes.
 
-- [ ] Create, edit, delete own listings.
-- [ ] Request a tool for a date range.
-- [ ] Approve or decline incoming requests.
-- [ ] Mark a loan returned.
-- [ ] All tools with availability, filterable by category.
-- [ ] My listings, My requests, Incoming requests views.
-- [ ] Clean, minimal, responsive layout.
+**Security**
 
-**Roles and rules**
+- [ ] RBAC is enforced in Convex functions and HTTP handlers, with tests per matrix row.
+- [ ] Read scoping covers tool detail, loan detail, and timeline; non-parties get `NOT_FOUND`.
+- [ ] Clerk `convex` JWT template includes `email`, `email_verified`, and `name`.
+- [ ] Admin promotion and seed adoption require a verified email.
+- [ ] Seed is an internal mutation, gated by `ALLOW_SEED`.
+- [ ] HMAC is verified on every `/n8n/*` endpoint, with method, path, timestamp, nonce, and canonical JSON.
+- [ ] Nonces are cached for the replay window.
+- [ ] The overdue response is signed and verified by n8n.
+- [ ] Secrets are absent from the repo and workflow JSON.
+- [ ] The n8n editor is not exposed through the tunnel.
+- [ ] Audit rows are written for admin writes and are append-only by test.
+- [ ] Private-resource errors are `NOT_FOUND`, not existence leaks.
 
-- [ ] Admin can remove any listing, view all loans, mark trusted lender.
-- [ ] User can act only on own listings and own loans.
-- [ ] RBAC enforced in Convex, with tests.
+**Reliability**
 
-**Automation**
+- [ ] Outbox enqueue is transactional with the loan change.
+- [ ] Outbox claim is atomic and token-checked.
+- [ ] Stale `sending` rows are swept and retried.
+- [ ] Backoff and attempt limits are enforced, with an alert at the third failure.
+- [ ] Reminder claim-then-send uses a lease and a per-day key.
+- [ ] Reminder status is monotonic and token-checked.
+- [ ] The request workflow returns 200 only after signature verification, mock logging, and write-back.
+- [ ] The error workflow writes a visible alert with a fallback id.
+- [ ] Admin automation view shows pending, sending, sent, failed, and unresolved alerts.
 
-- [ ] Request webhook fires on creation and status change.
-- [ ] Daily overdue workflow fetches, reminds, and writes back.
-- [ ] HMAC signing in both directions with separate secrets.
-- [ ] Secrets only in env and credentials.
-- [ ] Idempotent write-backs.
-- [ ] Retries and a visible error workflow.
-- [ ] Bonus: recent automation activity on each loan.
+**Integration**
 
-**Deliverables**
+- [ ] Two required workflows plus an error workflow are exported as JSON.
+- [ ] Workflows use stable ids and `settings.errorWorkflow`.
+- [ ] Import deactivates-by-default is handled, and activation is verified.
+- [ ] The Webhook node uses `responseMode: "responseNode"`.
+- [ ] `crypto` is allowed in Code nodes, and a smoke test proves it.
+- [ ] n8n uses Postgres with the full `DB_*` configuration.
+- [ ] The n8n image is pinned.
+- [ ] The TypeScript and Code-node canonicalizers pass the same vectors.
+- [ ] `docker compose config` passes.
 
-- [ ] Public repo with app source.
-- [ ] Exported workflow JSON in the repo.
-- [ ] README with setup, env vars, architecture, security, data minimization, screenshots, and a reviewer walkthrough.
-- [ ] Production note.
-- [ ] Repo runs locally from documented steps with no live deployment required.
+**Delivery**
+
+- [ ] Public repo under `Noor-e-Bilal` with app source and workflow JSON.
+- [ ] README with setup, env vars, architecture, security, data minimization, observability, screenshots, and a reviewer walkthrough.
+- [ ] Troubleshooting table for the eight named failures.
+- [ ] Production note with reasoned trade-offs.
+- [ ] CI runs install, lint, typecheck, tests, workflow verification, and compose config.
+- [ ] The repo runs locally from documented steps. No live deployment.
+- [ ] The reviewer signs in with their own `ADMIN_EMAILS` and sees populated Incoming, My requests, and Admin views.
