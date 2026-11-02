@@ -345,13 +345,14 @@ Visible failures reported by the n8n error workflow or the outbox.
 
 ```ts
 {
-  alertId: string,          // logically unique; n8n execution id or "outbox:<eventId>:<attempt>"
+  alertId: string,          // logically unique; n8n execution id, or "outbox:<eventId>"
   source: "n8n" | "outbox",
   workflowName?: string,
   executionId?: string,
   message: string,          // truncated; no payload PII
   resolvedAt?: number,
   createdAt: number,
+  updatedAt: number,
 }
 ```
 
@@ -574,9 +575,9 @@ Each verifier also accepts `<NAME>_PREVIOUS` when present, for a dual-secret rot
 **Dispatch action.** Calls `claimOutbox`. If `null`, returns. Otherwise POSTs to the full `N8N_WEBHOOK_URL` with a 10-second timeout and the signature headers plus `Idempotency-Key: <eventId>`.
 
 - 2xx: call `markOutboxSent` with the claim token. The mutation patches only if the token still matches, so a dispatcher whose lease was swept cannot mark a reclaimed row.
-- 429 or 5xx: `markOutboxRetry` with the token. It sets `status: "pending"`, clears the token, sets the next backoff, schedules `internal.automation.dispatch` at `nextAttemptAt` with `ctx.scheduler.runAt`, and stores a short `lastError`. The five-minute sweep is a safety net, not the primary timer. After the third failed attempt it writes an `automationAlert` once (`source: "outbox"`, `alertedAt` set) and keeps retrying.
+- 429 or 5xx: `markOutboxRetry` with the token. It sets `status: "pending"`, clears the token, sets the next backoff, schedules `internal.automation.dispatch` at `nextAttemptAt` with `ctx.scheduler.runAt`, and stores a short `lastError`. The five-minute sweep is a safety net, not the primary timer. After the third failed attempt it upserts one `automationAlert` with `alertId: "outbox:" + eventId`, `source: "outbox"`, and `alertedAt` set, then keeps retrying. Attempt 3 is the only time the alert is created; exhaustion updates it.
 - Other 4xx: `markOutboxFailed` with the token. It sets `status: "failed"` and writes an alert, because a 4xx usually means a configuration or signature error that retrying will not fix.
-- Attempts exhausted: `status: "failed"`, the linked `automationEvent` is marked `failed`, and an alert is written.
+- Attempts exhausted: `status: "failed"`, the linked `automationEvent` is marked `failed`, and the existing outbox alert (`alertId: "outbox:" + eventId`) is updated with the final error. It does not create a second alert.
 
 **Backoff.** 30 seconds, 2 minutes, 10 minutes, 30 minutes, 2 hours. Six attempts total, about 2 hours 42 minutes. The alert fires after the third failed attempt, roughly 2 minutes 30 seconds in. A request is not left unnotified for most of a day.
 
@@ -627,14 +628,14 @@ Updates the `automationEvent` with the matching `eventId`. Missing event returns
 
 `asOf` defaults to `boardToday`; `limit` defaults to 100 and is clamped and validated to 1..200. `cursor` is optional, opaque, and length-checked; an invalid cursor returns 400. The handler calls `claimOverdueReminders` in one mutation:
 
-- Query approved loans with `endDate < asOf`, ordered by `endDate`. If `cursor` is present, load the cursor loan and use `startAfter` on `by_status_endDate`.
+- Query approved loans with `endDate < asOf`, ordered by `endDate` and then `_id`. If `cursor` is present, decode `{ endDate, loanId }` and query `endDate >= cursor.endDate`; skip rows where `endDate === cursor.endDate && _id <= cursor.loanId`. The cursor is positional, not a document reference, so it still works if the cursor loan was returned or removed between pages.
 - Scan candidates until `limit` reminders are claimed or a 1,000-document scan cap is reached, whichever comes first.
 - For each loan, `reminderKey = ${loanId}:${asOf}`.
 - If a reminder exists with status `sent`, skip.
 - If it exists with status `claimed` and `claimedAt > now - 30 minutes`, skip as in-flight.
 - Otherwise claim it: set `status: "claimed"`, a new `claimToken`, `claimedAt: now`, and `attemptedAt: now`.
 - If no reminder exists, insert a claimed row.
-- Return `{ claims: [...], nextCursor: <last examined loan id or null> }`. n8n loops while `nextCursor` is non-null, so loans beyond the first page are not starved.
+- Return `{ claims: [...], nextCursor }`, where `nextCursor` is base64-encoded JSON `{ endDate, loanId }` for the last examined loan, or `null` when the scan reached the end. n8n loops while `nextCursor` is non-null, so loans beyond the first page are not starved.
 - Each claim is `{ loanId, reminderKey, claimToken, borrowerName, toolName, startDate, endDate, daysOverdue }`.
 
 The response is signed. It contains names and dates only, no email addresses. Convex limits a transaction to 32,000 scanned documents; 200 reminders is far below that, and the limit is documented.
@@ -677,14 +678,15 @@ A successful response means the event was verified, logged, and written back. A 
 File: `workflows/overdue-reminders.json`. Stable id `lendloop-overdue-reminders`. `settings.errorWorkflow` points to `lendloop-error-handler`. `settings.timezone` is cleared so `GENERIC_TIMEZONE` applies.
 
 1. **Schedule Trigger** daily at 09:00 in `GENERIC_TIMEZONE`. The schedule time only decides when the run starts; Convex computes `asOf` from the board date.
-2. **Code: Sign request.** Canonical string for `POST /n8n/overdue`, body `{ "limit": 100 }`, fresh nonce, `N8N_TO_CONVEX_SECRET`.
-3. **HTTP Request: Claim overdue reminders.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/overdue` with signature headers. Enable the node's full-response option so the status code and `X-LendLoop-*` response headers are available to the next node; the body is then at `$response.body`. If `nextCursor` is non-null, repeat until all pages are claimed.
-4. **Code: Verify response HMAC.** Recompute the canonical string for `POST /n8n/overdue` from `$response.body` and the signature headers in `$response.headers`, using `CONVEX_TO_N8N_SECRET`. Reject on mismatch.
-5. **Loop Over Items** over `claims`.
-6. **Code: Log mock reminder.** Include `reminderKey`, borrower name, tool, dates, and `daysOverdue`.
-7. **Code: Sign reminder status.**
-8. **HTTP Request: Write reminder status.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/reminder-status` with `{ reminderKey, claimToken, status: "sent", sentAt }`. Set `onError: continueErrorOutput` so one failure does not abort the rest of the batch.
-9. **Error branch: Sign and write failed status.** POST `status: "failed"`, `error`, `attemptedAt`. If this also fails, let the execution fail so the error workflow alerts.
+2. **Code: Initialize paging.** Set `cursor = null`, `claims = []`, and `page = 0`.
+3. **Code: Sign page request.** Canonical string for `POST /n8n/overdue`, body `{ "limit": 100 }` with `cursor` added when non-null, fresh nonce and timestamp, `N8N_TO_CONVEX_SECRET`. Every page is signed separately.
+4. **HTTP Request: Claim overdue reminders.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/overdue` with signature headers. Enable the node's full-response option so the status code and `X-LendLoop-*` response headers are available to the next node; the body is then at `$response.body`.
+5. **Code: Verify page and accumulate.** Recompute the canonical string for `POST /n8n/overdue` from the exact body sent on this page, `$response.body`, and the signature headers in `$response.headers`, using `CONVEX_TO_N8N_SECRET`. Reject on mismatch. Append `body.claims` to `claims`, set `cursor = body.nextCursor`, and increment `page`. If `cursor` is non-null and `page < 50`, return to step 3. The 50-page cap is a loop guard; otherwise continue.
+6. **Loop Over Items** over the accumulated `claims`.
+7. **Code: Log mock reminder.** Include `reminderKey`, borrower name, tool, dates, and `daysOverdue`.
+8. **Code: Sign reminder status.**
+9. **HTTP Request: Write reminder status.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/reminder-status` with `{ reminderKey, claimToken, status: "sent", sentAt }`. Set `onError: continueErrorOutput` so one failure does not abort the rest of the batch.
+10. **Error branch: Sign and write failed status.** POST `status: "failed"`, `error`, `attemptedAt`. If this also fails, let the execution fail so the error workflow alerts.
 
 An empty claims list ends the run without error. A claim whose write-back never lands is reclaimed by a same-day rerun after 30 minutes. If no rerun happens, the daily cron marks `claimed` rows older than 24 hours as `failed` with `error: "claim expired"`, and the next day's run creates a new per-day reminder. This is at-least-once delivery with a dedupe key, which is the honest guarantee for a mock channel; a real provider would also receive the `reminderKey` as its idempotency key.
 
@@ -878,7 +880,9 @@ The compose file is valid without the app for the n8n-only smoke test, and `dock
 
 `npm run tunnel:sync` re-reads a restarted tunnel and updates `N8N_WEBHOOK_URL` on Convex without rebuilding the app. The README tells the reviewer to run it after a Docker restart, since the quick tunnel URL changes.
 
-`npm run seed` wraps the internal mutation and accepts an optional email. Re-running finds an existing user by email first: if the placeholder was adopted, the real user row is reused; if a real user already exists, the demo rows attach to that user; only when neither exists is a `seed:<email>` placeholder created. It never rewrites a real Clerk id and never creates a second row for the same email. Reset deletes only unadopted seed rows.
+`npm run seed` wraps the internal mutation and accepts an optional email. Re-running finds an existing user by email first: if the placeholder was adopted, the real user row is reused; if a real user already exists, the demo rows attach to that user; only when neither exists is a `seed:<email>` placeholder created. It never rewrites a real Clerk id and never creates a second row for the same email.
+
+`seed.run({ adminEmail, reset })` identifies demo rows by `seedKey`, not by the owner's adoption state. `reset: true` deletes rows with a `seedKey` only when they belong to the user named by `adminEmail` (placeholder or real), then recreates them. It never deletes another user's data, and it is allowed after adoption so a reviewer can restore a clean demo. `reset` defaults to `false`; setup and the plain `npm run seed` upsert without deleting. `npm run seed -- --reset` is the documented clean-slate command.
 
 ### 11.4 Reviewer quick start
 
@@ -912,7 +916,7 @@ The README includes screenshots of every route and a two-minute walkthrough, so 
   2. An approved overdue loan on a different admin-owned tool, borrowed by a fictional user.
   3. An approved, not-yet-due loan on a third admin-owned tool, so the admin can mark it returned.
   4. A pending request from the admin to a fictional neighbor's tool, so "My requests" is populated.
-- Upserts one `automationEvent` for each demo loan: a delivered request notification for loan 1, a delivered reminder for loan 2, a delivered approval for loan 3, and a queued request for loan 4. Each is labeled `Demo event` in the detail so it is not mistaken for a live run.
+- Upserts one terminal `automationEvent` for each demo loan: a delivered request notification for loan 1, a delivered reminder for loan 2, a delivered approval for loan 3, and a delivered request notification for loan 4. Each is labeled `Demo event` in the detail. Demo events never enter `queued`, because the seed does not create outbox rows and a queued event with no dispatcher would look stuck.
 - Uses deterministic keys and read-then-insert checks. Re-running is safe.
 - Fixture dates are computed relative to `boardToday`, never hardcoded, so the seed does not go stale.
 
