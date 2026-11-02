@@ -855,9 +855,9 @@ The compose file is valid without the app for the n8n-only smoke test, and `dock
 
 1. Validate `.env`. Fail with a named missing key, not a stack trace.
 2. `npx convex dev --once`. This links or creates the deployment and writes `CONVEX_DEPLOYMENT` and the deployment URL. Do not hand-write `CONVEX_DEPLOYMENT`.
-3. Read the deployment URL and site URL. Set Convex env vars with `npx convex env set` after the deployment is linked: `ADMIN_EMAILS`, `BOARD_UTC_OFFSET_MINUTES`, `CLERK_JWT_ISSUER_DOMAIN`, both secrets, `APP_BASE_URL`, and `ALLOW_SEED=true`. Write `CONVEX_SITE_URL` to `.env.local` for the n8n containers. `N8N_WEBHOOK_URL` waits for the tunnel.
+3. Read the deployment URL and site URL. Set Convex env vars with `npx convex env set` after the deployment is linked: `ADMIN_EMAILS`, `BOARD_UTC_OFFSET_MINUTES`, `CLERK_JWT_ISSUER_DOMAIN`, both secrets, `APP_BASE_URL`, and `ALLOW_SEED=true`. Write `CONVEX_SITE_URL` to `.env` for the n8n containers, since Docker Compose reads `.env`, not `.env.local`. `N8N_WEBHOOK_URL` waits for the tunnel.
 4. `docker compose up -d postgres n8n`, wait for both healthchecks.
-5. Start `cloudflared`, read the tunnel URL from its logs with a 60-second timeout. Fail loudly if it is not found. Write the full `N8N_WEBHOOK_URL=<tunnel>/webhook/lendloop-events` to `.env.local` and set it on Convex.
+5. Start `cloudflared`, read the tunnel URL from its logs with a 60-second timeout. Fail loudly if it is not found. Write the full `N8N_WEBHOOK_URL=<tunnel>/webhook/lendloop-events` to `.env` and set it on Convex.
 6. `docker compose up -d n8n-import proxy`. The importer waits for n8n health, imports, activates, and verifies.
 7. `docker compose build app`, then `docker compose up -d app`. The build happens after `NEXT_PUBLIC_CONVEX_URL` is known.
 8. Run the seed: `npx convex run seed:run '{"adminEmail":"<first ADMIN_EMAILS>"}'`. The seed is an internal mutation.
