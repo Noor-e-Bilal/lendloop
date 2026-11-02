@@ -969,7 +969,7 @@ These are sequenced into Phase 0 and budgeted:
 - HTTP handlers log the signature result and idempotency outcome, never the signature.
 - The admin automation view exposes queue depth, `sending` count, failures, unresolved alerts, and the last error per row.
 - `GET /health` is a cheap liveness signal for compose and an uptime monitor.
-- The production note maps these signals to CloudWatch, Datadog, and Sentry, which the role description names.
+- The production note maps these signals to CloudWatch, Datadog, and Sentry as the expected production stack for this kind of role.
 
 ## 13. Testing
 
@@ -1015,7 +1015,7 @@ This section is deliberately short and reasoned. It answers "what would change i
 
 **Identity.** Keep Clerk, or move to Cognito if the rest of the stack is AWS. Either way, verify email at the identity provider, keep role assignment server-side, and add SSO and MFA for admins. Add a demotion and offboarding runbook with audit records.
 
-**Data.** Convex is a good fit for a 24-hour product and is the BaaS bonus the role description calls out. For a regulated deployment, document data residency, retention, and deletion. If Convex is not retained, the relational shape maps to RDS Postgres; the loan and reminder tables are the core. Do not split relational data across RDS and DynamoDB without a access-pattern reason. Encrypt at rest and in transit, and keep PII out of automation payloads and logs.
+**Data.** Convex is a good fit for a 24-hour product and satisfies the BaaS requirement in the brief. For a regulated deployment, document data residency, retention, and deletion. If Convex is not retained, the relational shape maps to RDS Postgres; the loan and reminder tables are the core. Do not split relational data across RDS and DynamoDB without an access-pattern reason. Encrypt at rest and in transit, and keep PII out of automation payloads and logs.
 
 **Automation.** The claim-then-send reminder flow is implemented here because it is a correctness requirement, not a production nicety. For a real channel, pass `reminderKey` as the provider idempotency key, add a dead-letter queue for exhausted outbox rows, and add SLOs for notification latency. Run n8n in queue mode with workers on ECS, RDS Postgres, secrets from AWS Secrets Manager, no public editor, and execution pruning. Acknowledge alerts and route them to an on-call channel.
 
