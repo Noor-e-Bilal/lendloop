@@ -1,0 +1,39 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+.next/
+out/
+build/
+dist/
+next-env.d.ts
+
+# environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# convex
+.convex/
+
+# n8n local data
+n8n_data/
+docker/n8n-data/
+
+# logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# testing
+coverage/
+
+# typescript
+*.tsbuildinfo
+
+# os
+.DS_Store
+Thumbs.db
