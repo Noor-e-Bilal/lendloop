@@ -128,7 +128,7 @@ lendloop/
     schema.ts
     auth.config.ts                 applicationID: "convex"
     http.ts                        signed n8n endpoints + health
-    crons.ts                       outbox sweep, nonce cleanup, request expiry
+    crons.ts                       outbox sweep, nonce cleanup, request expiry, stale claim expiry
     users.ts
     tools.ts
     loans.ts
@@ -235,7 +235,8 @@ Soft removal preserves loan history and avoids broken references. Removed tools 
   startDate: string,        // YYYY-MM-DD
   endDate: string,
   status: "pending" | "approved" | "declined" | "cancelled" | "returned" | "expired",
-  message?: string,         // 0..300 chars
+  message?: string,         // borrower's note, 0..300 chars
+  decisionReason?: string,  // "TOOL_REMOVED", "LENDER_DECLINED", "BORROWER_CANCELLED"
   seedKey?: string,
   requestedAt: number,
   decidedAt?: number,
@@ -263,6 +264,8 @@ Overlap check: query approved loans for the tool with `startDate <= requestedEnd
   channel: string,          // "mock"
   status: "queued" | "delivered" | "failed" | "received",
   detail?: string,          // short summary; names only, no email or address
+  executionId?: string,     // n8n execution id when reported
+  error?: string,           // truncated failure text, no PII
   createdAt: number,
   updatedAt: number,
 }
@@ -397,7 +400,7 @@ Rules:
 - Cancel is allowed only by the borrower and only from `pending`.
 - Mark returned is allowed by the lender or the borrower, only from `approved`.
 - A pending request whose `endDate < boardToday - 1 day` is expired. A cron marks it `expired`; queries also treat it as expired so the rule is correct between cron runs.
-- Removed tools cannot receive new requests; pending requests on removal are declined with the reason `TOOL_REMOVED`.
+- Removed tools cannot receive new requests; pending requests on removal are declined with `decisionReason: "TOOL_REMOVED"`, which is shown on `/requests` and in the timeline.
 - A user may hold at most 5 pending requests per tool and 50 active listings. These guards are cheap abuse prevention.
 - A borrower may hold at most 20 pending requests in total. This closes the "50 listings times 5 per tool" gap.
 
@@ -451,9 +454,9 @@ The public list shows only tools that are `available` today, because the brief a
 
 Admin removal and trusted-lender changes are audited. Viewing all loans is authorized but not audited, because it is a read.
 
-Read scoping is explicit: `loans.getDetail`, `loans.timeline`, and `tools.getDetail` take an id and must check that the caller is a party or an admin. Unauthorized and missing rows both return `NOT_FOUND`, so ids cannot be probed.
+Read scoping is explicit: `loans.getDetail` and `loans.timeline` require the caller to be the borrower, the lender, or an admin. `tools.getDetail` allows any authenticated user when the tool is active, and only the owner or an admin when it is removed. Unauthorized and missing rows both return `NOT_FOUND`, so ids cannot be probed.
 
-`trustedLender` is a visual trust signal only. It grants no permission and changes no query result beyond the badge. All list queries are bounded: public and browse lists take at most 60, admin loans and audit lists are paginated at 50 per page or capped at 200, and a loan timeline returns at most 50 events.
+`trustedLender` is a visual trust signal only. It grants no permission and changes no query result beyond the badge. All list queries are paginated: public and browse lists return 60 per page with a cursor and a "Load more" control, admin loans and audit lists return 50 per page or cap at 200, and a loan timeline returns at most 50 events.
 
 ### 7.4 Enforcement pattern
 
@@ -474,18 +477,22 @@ Convex HTTP actions do not receive a Clerk session. The `/n8n/*` handlers use a 
 1. Read the Clerk identity. Throw `UNAUTHENTICATED` if absent.
 2. Require `identity.email` and `identity.emailVerified === true`. Throw `EMAIL_UNVERIFIED` otherwise. Phone-only users are unsupported and documented.
 3. Normalize the email to lowercase.
-4. Look up by `clerkId`. If found, return the row.
+4. Look up by `clerkId`. If found:
+   - Update `email`, `name`, and `imageUrl` when the verified Clerk profile changed.
+   - If the email is in `ADMIN_EMAILS` and `role !== "admin"`, promote to `admin` and write an audit row.
+   - Return the row.
 5. Look up by email.
-   - If the row's `clerkId` starts with `seed:` and `adoptedAt` is absent, adopt it: set `clerkId` to the Clerk subject, update `name` and `imageUrl`, and set `adoptedAt`. Keep the role, tools, and loans.
+   - If the row's `clerkId` starts with `seed:` and `adoptedAt` is absent, adopt it: set `clerkId` to the Clerk subject, update `name` and `imageUrl`, and set `adoptedAt`. Keep the role, tools, and loans. Apply the `ADMIN_EMAILS` promotion check as in step 4.
    - If the row belongs to another real Clerk subject, throw `ACCOUNT_CONFLICT`. Never silently merge two identities.
 6. If no row exists, insert a user. The role is `admin` only when the verified email is in `ADMIN_EMAILS`; otherwise `user`.
-7. If an existing non-admin's verified email is in `ADMIN_EMAILS`, promote to `admin` and write an audit row. Promotion is additive. Demotion is never automatic; `admin.demote` is an internal mutation run by the operator and writes an audit row.
+
+Promotion is additive and re-evaluated on every sign-in, so changing `ADMIN_EMAILS` and signing in again promotes an existing user. Demotion is never automatic; `admin.demote` is an internal mutation run by the operator and writes an audit row.
 
 `ADMIN_EMAILS` is parsed once from the environment, lowercased, trimmed, and compared exactly. The README requires the reviewer to use a verified email and to enable email verification in Clerk. This closes the unverified-email privilege-escalation path.
 
 ## 8. Public data minimization
 
-- `tools.publicList` is unauthenticated, returns at most 60 tools, and projects only `{ _id, name, category }`. It filters to active tools that are `available` today.
+- `tools.publicList` is unauthenticated, returns up to 60 tools plus a cursor, and projects only `{ _id, name, category }`. It filters to active tools that are `available` today.
 - It never returns owner id, owner name, description, condition, image, dates, or loan data.
 - The public page has no query that accepts a user id.
 - Authenticated queries return the owner's display name and trusted badge because borrowing from a neighbor requires knowing who they are. Email addresses are never returned to other users.
@@ -567,11 +574,11 @@ Each verifier also accepts `<NAME>_PREVIOUS` when present, for a dual-secret rot
 **Dispatch action.** Calls `claimOutbox`. If `null`, returns. Otherwise POSTs to the full `N8N_WEBHOOK_URL` with a 10-second timeout and the signature headers plus `Idempotency-Key: <eventId>`.
 
 - 2xx: call `markOutboxSent` with the claim token. The mutation patches only if the token still matches, so a dispatcher whose lease was swept cannot mark a reclaimed row.
-- 429 or 5xx: `markOutboxRetry` with the token. It sets `status: "pending"`, clears the token, sets the next backoff, and stores a short `lastError`. After the third failed attempt it writes an `automationAlert` once (`source: "outbox"`, `alertedAt` set) and keeps retrying.
+- 429 or 5xx: `markOutboxRetry` with the token. It sets `status: "pending"`, clears the token, sets the next backoff, schedules `internal.automation.dispatch` at `nextAttemptAt` with `ctx.scheduler.runAt`, and stores a short `lastError`. The five-minute sweep is a safety net, not the primary timer. After the third failed attempt it writes an `automationAlert` once (`source: "outbox"`, `alertedAt` set) and keeps retrying.
 - Other 4xx: `markOutboxFailed` with the token. It sets `status: "failed"` and writes an alert, because a 4xx usually means a configuration or signature error that retrying will not fix.
 - Attempts exhausted: `status: "failed"`, the linked `automationEvent` is marked `failed`, and an alert is written.
 
-**Backoff.** 30 seconds, 2 minutes, 10 minutes, 30 minutes, 2 hours. Six attempts total, about 2 hours 42 minutes. A request is not left unnotified for most of a day, and the admin alert fires at 10 minutes.
+**Backoff.** 30 seconds, 2 minutes, 10 minutes, 30 minutes, 2 hours. Six attempts total, about 2 hours 42 minutes. The alert fires after the third failed attempt, roughly 2 minutes 30 seconds in. A request is not left unnotified for most of a day.
 
 **Sweep.** A five-minute cron:
 
@@ -610,7 +617,7 @@ All `/n8n/*` handlers are POST, signed, nonce-checked, body-limited, and hand-va
 { "eventId": "uuid", "status": "delivered", "executionId": "n8n-exec-id", "error": "optional short text" }
 ```
 
-Updates the `automationEvent` with the matching `eventId`. Missing event returns 404. Repeated delivery is a no-op. `error` is omitted when absent; `null` is rejected so the optional Convex validator is satisfied. The handler never writes raw payloads into the event.
+Updates the `automationEvent` with the matching `eventId`. Missing event returns 404. Repeated delivery is a no-op. `executionId` and `error` are stored on the event when present. `error` is omitted when absent; `null` is rejected so the optional Convex validator is satisfied. The handler never writes raw payloads into the event.
 
 **`POST /n8n/overdue`** (n8n to Convex)
 
@@ -618,25 +625,27 @@ Updates the `automationEvent` with the matching `eventId`. Missing event returns
 { "asOf": "2026-11-03", "limit": 100 }
 ```
 
-`asOf` defaults to `boardToday`; `limit` defaults to 100 and is clamped and validated to 1..200. The handler calls `claimOverdueReminders` in one mutation:
+`asOf` defaults to `boardToday`; `limit` defaults to 100 and is clamped and validated to 1..200. `cursor` is optional, opaque, and length-checked; an invalid cursor returns 400. The handler calls `claimOverdueReminders` in one mutation:
 
-- Query approved loans with `endDate < asOf`, ordered by `endDate`, `take(limit)`.
+- Query approved loans with `endDate < asOf`, ordered by `endDate`. If `cursor` is present, load the cursor loan and use `startAfter` on `by_status_endDate`.
+- Scan candidates until `limit` reminders are claimed or a 1,000-document scan cap is reached, whichever comes first.
 - For each loan, `reminderKey = ${loanId}:${asOf}`.
 - If a reminder exists with status `sent`, skip.
 - If it exists with status `claimed` and `claimedAt > now - 30 minutes`, skip as in-flight.
 - Otherwise claim it: set `status: "claimed"`, a new `claimToken`, `claimedAt: now`, and `attemptedAt: now`.
 - If no reminder exists, insert a claimed row.
-- Return `{ claims: [{ loanId, reminderKey, claimToken, borrowerName, toolName, startDate, endDate, daysOverdue }] }`.
+- Return `{ claims: [...], nextCursor: <last examined loan id or null> }`. n8n loops while `nextCursor` is non-null, so loans beyond the first page are not starved.
+- Each claim is `{ loanId, reminderKey, claimToken, borrowerName, toolName, startDate, endDate, daysOverdue }`.
 
 The response is signed. It contains names and dates only, no email addresses. Convex limits a transaction to 32,000 scanned documents; 200 reminders is far below that, and the limit is documented.
 
 **`POST /n8n/reminder-status`** (n8n to Convex)
 
 ```json
-{ "reminderKey": "loanId:2026-11-03", "claimToken": "uuid", "status": "sent", "sentAt": 1762300000000, "error": "optional" }
+{ "reminderKey": "loanId:2026-11-03", "claimToken": "uuid", "status": "sent", "sentAt": 1762300000000, "attemptedAt": 1762300000000, "error": "optional" }
 ```
 
-Validates the key format and that the loan exists. It does not require the loan to still be approved: a loan can be returned between claim and write-back, and the notification status describes the reminder, not the loan's current state. Checks the claim token; a stale or mismatched token returns 409. Transitions are monotonic: `claimed` to `sent` or `failed`; `sent` is terminal; a later `failed` is recorded as an `automationEvent` and an alert but does not downgrade the reminder. Writes/updates the corresponding `automationEvent` with `eventId: "reminder:" + reminderKey`. A repeated `sent` is a no-op. `sentAt` is required only for `sent`; failed rows use `attemptedAt`.
+Validates the key format and that the loan exists. It does not require the loan to still be approved: a loan can be returned between claim and write-back, and the notification status describes the reminder, not the loan's current state. Checks the claim token; a stale or mismatched token returns 409. Transitions are monotonic: `claimed` to `sent` or `failed`; `sent` is terminal; a later `failed` is recorded as an `automationEvent` and an alert but does not downgrade the reminder. Writes/updates the corresponding `automationEvent` with `eventId: "reminder:" + reminderKey`; a `sent` reminder maps to event status `delivered`, and `failed` maps to `failed`. A repeated `sent` is a no-op. `sentAt` is required only for `sent`; failed rows use `attemptedAt`, which defaults to now when omitted.
 
 **`POST /n8n/alert`** (n8n error workflow to Convex)
 
@@ -669,15 +678,15 @@ File: `workflows/overdue-reminders.json`. Stable id `lendloop-overdue-reminders`
 
 1. **Schedule Trigger** daily at 09:00 in `GENERIC_TIMEZONE`. The schedule time only decides when the run starts; Convex computes `asOf` from the board date.
 2. **Code: Sign request.** Canonical string for `POST /n8n/overdue`, body `{ "limit": 100 }`, fresh nonce, `N8N_TO_CONVEX_SECRET`.
-3. **HTTP Request: Claim overdue reminders.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/overdue` with signature headers.
-4. **Code: Verify response HMAC.** Recompute the canonical string for `POST /n8n/overdue` from the response body and the response signature headers, using `CONVEX_TO_N8N_SECRET`. Reject on mismatch.
+3. **HTTP Request: Claim overdue reminders.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/overdue` with signature headers. Enable the node's full-response option so the status code and `X-LendLoop-*` response headers are available to the next node; the body is then at `$response.body`. If `nextCursor` is non-null, repeat until all pages are claimed.
+4. **Code: Verify response HMAC.** Recompute the canonical string for `POST /n8n/overdue` from `$response.body` and the signature headers in `$response.headers`, using `CONVEX_TO_N8N_SECRET`. Reject on mismatch.
 5. **Loop Over Items** over `claims`.
 6. **Code: Log mock reminder.** Include `reminderKey`, borrower name, tool, dates, and `daysOverdue`.
 7. **Code: Sign reminder status.**
 8. **HTTP Request: Write reminder status.** `POST {{ $env.CONVEX_SITE_URL }}/n8n/reminder-status` with `{ reminderKey, claimToken, status: "sent", sentAt }`. Set `onError: continueErrorOutput` so one failure does not abort the rest of the batch.
 9. **Error branch: Sign and write failed status.** POST `status: "failed"`, `error`, `attemptedAt`. If this also fails, let the execution fail so the error workflow alerts.
 
-An empty claims list ends the run without error. A claim whose write-back never lands expires after 30 minutes and is retried on the next run. This is at-least-once delivery with a dedupe key, which is the honest guarantee for a mock channel; a real provider would also receive the `reminderKey` as its idempotency key.
+An empty claims list ends the run without error. A claim whose write-back never lands is reclaimed by a same-day rerun after 30 minutes. If no rerun happens, the daily cron marks `claimed` rows older than 24 hours as `failed` with `error: "claim expired"`, and the next day's run creates a new per-day reminder. This is at-least-once delivery with a dedupe key, which is the honest guarantee for a mock channel; a real provider would also receive the `reminderKey` as its idempotency key.
 
 ### 9.7 Error workflow
 
@@ -722,7 +731,7 @@ EXECUTIONS_DATA_MAX_AGE=24
 N8N_DIAGNOSTICS_ENABLED=false
 ```
 
-With n8n 2.x, set the same `NODE_FUNCTION_ALLOW_BUILTIN` on the task runner service. If the pinned version requires owner setup, the importer waits for the owner to exist, or `N8N_USER_MANAGEMENT_DISABLED=true` is used for local-only access.
+In n8n 2.x, Code nodes run on task runners by default. The compose stack includes an `n8n-runner` service using the matching `n8nio/runners` image, with `N8N_RUNNERS_AUTH_TOKEN`, `N8N_RUNNERS_MODE=external`, the broker URI, and `NODE_FUNCTION_ALLOW_BUILTIN=crypto` in the runner launcher's env overrides. The exact keys follow the pinned version's documentation. Phase 0 must prove `require("crypto")` works in a Code node before any workflow is built. If the runner configuration blocks the build, pin the newest 1.x image, where Code nodes run in-process and the allowlist is a single environment variable; the tested version is recorded in the README either way. If the pinned version requires owner setup, the importer waits for the owner to exist, or `N8N_USER_MANAGEMENT_DISABLED=true` is used for local-only access.
 
 **Import and activation.** `n8n import:workflow` deactivates imported workflows by default. The one-shot importer:
 
@@ -760,7 +769,7 @@ The importer is a one-shot service with `restart: "no"`. A cold start race is pr
 
 **`/browse` authenticated**
 
-- All active tools, with owner name, trusted badge, availability pill, and `nextAvailableDate`.
+- All active tools, 60 per page with a Load more control, with owner name, trusted badge, availability pill, and `nextAvailableDate`.
 - Category filter.
 - Request action for any tool that is not the caller's and whose dates can be chosen without overlap.
 - The request dialog disables past dates and dates that overlap an approved loan, shows the conflict reason, and re-validates on submit. The UI never offers a range the server will reject for overlap.
@@ -803,7 +812,7 @@ The importer is a one-shot service with `restart: "no"`. A cold start race is pr
 
 - Loading skeletons for lists and the timeline.
 - Empty states for no tools, no requests, no incoming requests, and no alerts.
-- Error toasts mapped from Convex error codes: `UNAUTHENTICATED`, `EMAIL_UNVERIFIED`, `ACCOUNT_CONFLICT`, `VALIDATION`, `CONFLICT`, `NOT_FOUND`, `FORBIDDEN`, `RATE_LIMITED`.
+- Error toasts mapped from Convex error codes: `UNAUTHENTICATED`, `EMAIL_UNVERIFIED`, `ACCOUNT_CONFLICT`, `VALIDATION`, `CONFLICT`, `NOT_FOUND`, `FORBIDDEN`.
 - A global offline or failed-mutation state that does not lose the user's form input.
 
 ## 11. Local setup
@@ -818,7 +827,7 @@ Root `.env`, copied from `.env.example`. Never committed.
 | `CLERK_SECRET_KEY` | Next app runtime | Clerk server-side auth and middleware |
 | `CLERK_JWT_ISSUER_DOMAIN` | Convex env | Clerk JWT verification |
 | `NEXT_PUBLIC_CONVEX_URL` | Next app build time | Convex deployment URL; inlined by Next |
-| `CONVEX_DEPLOYMENT` | root `.env` | Written by `convex dev`, not hand-edited |
+| `CONVEX_DEPLOYMENT` | root `.env` or `.env.local` | Written by `convex dev`, not hand-edited; the setup script reads it from the CLI output rather than assuming a file |
 | `ADMIN_EMAILS` | Convex env | comma-separated verified admin emails |
 | `BOARD_UTC_OFFSET_MINUTES` | Convex env | board date offset, default `0` |
 | `CONVEX_TO_N8N_SECRET` | Convex env and n8n env | Convex signs, n8n verifies |
@@ -832,6 +841,9 @@ Root `.env`, copied from `.env.example`. Never committed.
 | `N8N_ENCRYPTION_KEY` | n8n env | n8n credential encryption |
 | `POSTGRES_PASSWORD` | compose | Postgres |
 | `N8N_IMAGE` | compose | pinned n8n image |
+| `N8N_RUNNERS_AUTH_TOKEN` | n8n and runner env | 2.x task-runner auth |
+| `NODE_FUNCTION_ALLOW_BUILTIN`, `N8N_BLOCK_ENV_ACCESS_IN_NODE`, `N8N_USER_MANAGEMENT_DISABLED`, `EXECUTIONS_DATA_PRUNE`, `EXECUTIONS_DATA_MAX_AGE`, `N8N_DIAGNOSTICS_ENABLED` | n8n and runner env | see 9.8 |
+| `DB_TYPE`, `DB_POSTGRESDB_HOST`, `DB_POSTGRESDB_PORT`, `DB_POSTGRESDB_DATABASE`, `DB_POSTGRESDB_USER`, `DB_POSTGRESDB_PASSWORD` | n8n env | Postgres connection, see 9.8 |
 | `GENERIC_TIMEZONE` | n8n env | schedule timezone |
 | `N8N_SECURE_COOKIE` | n8n env | `false` for local HTTP |
 | `CLOUDFLARED_IMAGE` | compose | pinned cloudflared image |
@@ -842,10 +854,11 @@ Root `.env`, copied from `.env.example`. Never committed.
 
 - `postgres`: Postgres 16, named volume, `pg_isready` healthcheck.
 - `n8n`: pinned image, depends on Postgres healthy, binds `127.0.0.1:5678:5678`, full `DB_*` config, crypto allowlist, execution pruning.
+- `n8n-runner` (2.x only): matching `n8nio/runners` image, broker auth token, crypto allowlist. Omitted when the pinned version runs Code nodes in-process.
 - `n8n-import`: one-shot, depends on n8n healthy, imports and activates, verifies active state, exits.
 - `proxy`: nginx, listens on 8080, forwards only `/webhook/*` and `/webhook-test/*` to n8n, returns 404 for everything else.
 - `cloudflared`: quick tunnel to `http://proxy:8080`, no account required.
-- `app`: Next.js standalone image. `NEXT_PUBLIC_CONVEX_URL` is a build arg, so the image is built after the Convex deployment is known. The setup script rebuilds when the value changes.
+- `app`: Next.js standalone image. `NEXT_PUBLIC_CONVEX_URL` and `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` are build args, because Next inlines both. The image is built after the Convex deployment and Clerk key are known, and the setup script passes both explicitly rather than relying on `.env` discovery.
 
 The compose file is valid without the app for the n8n-only smoke test, and `docker compose config` runs in CI.
 
@@ -859,13 +872,13 @@ The compose file is valid without the app for the n8n-only smoke test, and `dock
 4. `docker compose up -d postgres n8n`, wait for both healthchecks.
 5. Start `cloudflared`, read the tunnel URL from its logs with a 60-second timeout. Fail loudly if it is not found. Write the full `N8N_WEBHOOK_URL=<tunnel>/webhook/lendloop-events` to `.env` and set it on Convex.
 6. `docker compose up -d n8n-import proxy`. The importer waits for n8n health, imports, activates, and verifies.
-7. `docker compose build app`, then `docker compose up -d app`. The build happens after `NEXT_PUBLIC_CONVEX_URL` is known.
+7. `docker compose build app` with explicit `NEXT_PUBLIC_CONVEX_URL` and `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` build args read from the linked deployment and `.env`, then `docker compose up -d app`. The build happens after both values are known.
 8. Run the seed: `npx convex run seed:run '{"adminEmail":"<first ADMIN_EMAILS>"}'`. The seed is an internal mutation.
 9. Print the app URL, the admin email, the tunnel URL, and the next steps.
 
 `npm run tunnel:sync` re-reads a restarted tunnel and updates `N8N_WEBHOOK_URL` on Convex without rebuilding the app. The README tells the reviewer to run it after a Docker restart, since the quick tunnel URL changes.
 
-`npm run seed` wraps the internal mutation and accepts an optional email. Re-running resets only unadopted seed rows (`clerkId` beginning with `seed:`) and recreates them for the current admin email. It never deletes data owned by a real Clerk user.
+`npm run seed` wraps the internal mutation and accepts an optional email. Re-running finds an existing user by email first: if the placeholder was adopted, the real user row is reused; if a real user already exists, the demo rows attach to that user; only when neither exists is a `seed:<email>` placeholder created. It never rewrites a real Clerk id and never creates a second row for the same email. Reset deletes only unadopted seed rows.
 
 ### 11.4 Reviewer quick start
 
@@ -881,7 +894,7 @@ The README opens with this path:
 4. In `.env`, set `ADMIN_EMAILS` to the reviewer's own Clerk email and `BOARD_UTC_OFFSET_MINUTES` to their local offset (for example `-300` for US Eastern).
 5. `npm install`, `npx convex login`, `npm run setup`, `npm run seed`, open `http://localhost:3000`.
 6. Sign in with the `ADMIN_EMAILS` address. The seeded placeholder is adopted, and Incoming, My requests, and Admin are populated.
-7. If `ADMIN_EMAILS` changes, run `npm run seed` again and sign in with the new address.
+7. If `ADMIN_EMAILS` changes after first sign-in, run `npm run seed` again. It attaches the demo rows to the existing user with that email instead of creating a second row, and the next sign-in re-evaluates admin promotion.
 
 The README includes screenshots of every route and a two-minute walkthrough, so a reviewer can evaluate the UX without running anything. Screenshots are taken from the seeded admin account and labeled as demo data.
 
@@ -891,15 +904,15 @@ The README includes screenshots of every route and a two-minute walkthrough, so 
 
 `seed.run({ adminEmail })`:
 
-- Upserts a placeholder user for `adminEmail` with `clerkId: "seed:<email>"` and `role: "admin"`.
+- Finds a user by email. If a real user exists, it becomes the demo owner and is promoted to `admin`. If an unadopted `seed:<email>` placeholder exists, it is reused. Otherwise a placeholder with `clerkId: "seed:<email>"` and `role: "admin"` is created.
 - Upserts four fictional neighbors.
 - Upserts eight tools across power, garden, kitchen, camping, and hand tools, each with a `seedKey`.
-- Upserts four loans tied to the admin, each with a `seedKey`:
+- Upserts four loans tied to the admin, each with a `seedKey`, on four distinct tools with non-overlapping dates:
   1. A pending incoming request on an admin-owned tool, from a fictional borrower.
-  2. An approved overdue loan on an admin-owned tool, borrowed by a fictional user.
-  3. An approved, not-yet-due loan on an admin-owned tool, so the admin can mark it returned.
+  2. An approved overdue loan on a different admin-owned tool, borrowed by a fictional user.
+  3. An approved, not-yet-due loan on a third admin-owned tool, so the admin can mark it returned.
   4. A pending request from the admin to a fictional neighbor's tool, so "My requests" is populated.
-- Upserts `automationEvents` for the demo loans: a delivered request notification for the pending incoming request, a delivered reminder for the overdue loan, and a queued event for the admin's pending request. Each is labeled `Demo event` in the detail so it is not mistaken for a live run.
+- Upserts one `automationEvent` for each demo loan: a delivered request notification for loan 1, a delivered reminder for loan 2, a delivered approval for loan 3, and a queued request for loan 4. Each is labeled `Demo event` in the detail so it is not mistaken for a live run.
 - Uses deterministic keys and read-then-insert checks. Re-running is safe.
 - Fixture dates are computed relative to `boardToday`, never hardcoded, so the seed does not go stale.
 
@@ -923,7 +936,7 @@ These are sequenced into Phase 0 and budgeted:
 |---|---|
 | Broken access control | Server-side RBAC in every Convex function and HTTP handler. Read scoping for tools, loans, and timelines. `NOT_FOUND` for non-parties. Tests per matrix row. |
 | Spoofed or tampered webhook | HMAC-SHA256 over method, path, timestamp, nonce, and canonical JSON. Constant-time compare. 300-second window. Nonce replay cache. Separate secrets per direction. |
-| Replayed webhook | Nonce cache plus timestamp window. Idempotency keys on writes. Duplicate delivery is a no-op. |
+| Replayed webhook | Convex-side nonce cache plus timestamp window for n8n-to-Convex calls. Convex-to-n8n replays within the window can duplicate a mock log, but the write-back is idempotent by `eventId`, so no state is duplicated. |
 | Secret leak through repo or workflow JSON | Secrets only in `.env` and `n8n` env; workflow JSON uses `$env` references. `.gitignore` excludes `.env`. `verify-workflows.mjs` scans JSON for secret-shaped strings. |
 | Tunnel exposes the automation editor | The tunnel targets nginx, which forwards only `/webhook/*`. The n8n editor binds to localhost. |
 | Unverified email privilege escalation | `users.ensure` requires `email_verified` and a verified claim before admin promotion or seed adoption. Clerk email verification is required in setup. |
@@ -1034,11 +1047,11 @@ The estimates assume a clean start, the human steps in Phase 0, and a 24-hour wi
 | Phase | Work | Estimate |
 |---|---|---|
 | 0 | Accounts, Clerk JWT template and email verification, Convex link, repo scaffold, dependencies, tokens, fonts, CI skeleton, and a one-hour n8n smoke test (compose, import a trivial workflow, activate, call it from Convex) | 3h |
-| 1 | Schema, auth and `users.ensure`, seed adoption, RBAC helpers, tools and loans mutations and queries, outbox enqueue, tests | 5h |
-| 2 | HMAC and canonical JSON, nonce cache, HTTP endpoints with validation and body limits, outbox claim, lease, sweep, retries, tests | 3.5h |
+| 1 | Schema, auth and `users.ensure`, seed adoption, RBAC helpers, tools and loans mutations and queries, outbox enqueue, tests | 4.5h |
+| 2 | HMAC and canonical JSON, nonce cache, HTTP endpoints with validation and body limits, outbox claim, lease, sweep, retries, tests | 3h |
 | 3 | n8n workflows: request, overdue, error; activation and verification; response signing; canonicalizer parity; end-to-end smoke | 4.5h |
-| 4 | UI routes, components, request dialog with conflict prevention, timeline, admin tabs, empty and loading states | 3.5h |
-| 5 | Setup script, compose, proxy, tunnel, seed reset behavior, reviewer quick start, manual end-to-end verification | 2.5h |
+| 4 | UI routes, components, request dialog with conflict prevention, timeline, admin tabs, empty and loading states | 3h |
+| 5 | Setup script, compose, proxy, tunnel, seed reset behavior, reviewer quick start, manual end-to-end verification | 2h |
 | 6 | README, docs, screenshots, walkthrough, workflow verification, CI, final review | 2h |
 | Buffer | Unplanned framework or environment issues | 2h |
 
@@ -1127,3 +1140,5 @@ Everything else in this document is a requirement, not a suggestion.
 - [ ] CI runs install, lint, typecheck, tests, workflow verification, and compose config.
 - [ ] The repo runs locally from documented steps. No live deployment.
 - [ ] The reviewer signs in with their own `ADMIN_EMAILS` and sees populated Incoming, My requests, and Admin views.
+- [ ] Re-running `npm run setup` or `npm run seed` after first sign-in neither duplicates nor detaches the admin user.
+- [ ] The seeded pending Incoming request can actually be approved, because it uses a different tool from the overdue loan.
