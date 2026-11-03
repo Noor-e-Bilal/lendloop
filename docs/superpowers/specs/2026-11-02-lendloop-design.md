@@ -42,6 +42,8 @@ Success means a reviewer can open the repo, run it with their own free Clerk and
 
 Response signing is addressed in 9.2. The overdue response carries data, so it is signed. The request acknowledgement carries no data, so it is not. This satisfies "webhook payloads in both directions" without signing an empty ack.
 
+Two things go beyond the literal brief and are deliberate. Photos are added because a tool-lending product without them is not credible to a reviewer, and the brief's public projection (name and category) still holds, so photos stay behind authentication. Playwright is added because the brief grades the working app; server tests alone do not prove the signed-in path works. Both are scoped to one photo and one happy path to protect the schedule.
+
 ## 3. Decisions made with Nemesis
 
 | Decision | Choice | Why |
@@ -55,7 +57,9 @@ Response signing is addressed in 9.2. The overdue response carries data, so it i
 | Code complexity | Simplest code that is still industry-standard | Every non-obvious decision must be explainable in the README. |
 | Reviewer experience | Seed data adopts the reviewer's own admin email on first sign-in, and `npm run seed` is re-runnable after `ADMIN_EMAILS` changes | A reviewer who signs in as themselves must see incoming requests, an overdue loan, and an automation timeline without creating a second account. |
 | Identity claims | Clerk `convex` JWT template explicitly includes `email`, `email_verified`, and `name`; verified email is required | Clerk's default token omits these claims. Admin promotion and seed adoption are privilege operations and must require proof of email ownership. |
-| Timezone | One board date derived from `BOARD_UTC_OFFSET_MINUTES` (default `0`), with a one-day grace on request start dates | Avoids the unverified `Intl` dependency in the Convex runtime and keeps date logic deterministic. DST is a documented production improvement. |
+| Photos | One photo per tool, stored in Convex file storage, shown on authenticated browse, detail, and listings. Never on the public page | Tool lending without a photo is not credible, and Convex storage means no extra service. The brief limits the public projection to name and category, so the public page stays text-only. |
+| End-to-end test | Playwright, Chromium only, one happy path through request approval plus one authorization negative | Unit tests prove the server rules; an E2E proves the reviewer's path actually works with Clerk and Convex wired together. Clerk testing tokens avoid a test-only auth backdoor. |
+| Timezone | A Phase 0 spike tests whether `Intl` with a timezone works in the Convex runtime. If it does, store each user's IANA zone and use it for date validation and overdue display. If not, one board date from `BOARD_UTC_OFFSET_MINUTES` plus a one-day grace | Per-user timezones are the correct design, but they depend on runtime tz data that was not verified. A ten-minute spike turns an assumption into a measured decision instead of a guess. |
 | Response signing | Overdue response is HMAC-signed and verified by n8n. The empty request acknowledgement is not signed | Closes the "both directions" ambiguity and protects the PII-bearing response. The ack carries no data. |
 | Audit scope | Audit writes only, never reads. Admin promotion and demotion are audited | Convex queries cannot write. A mutation fired on page load to record a view is a write-on-read smell. |
 | n8n version | Pin the exact image version after the first successful smoke test; never use `latest` | Import and activation commands changed between major versions. The README records the tested version. |
@@ -63,16 +67,24 @@ Response signing is addressed in 9.2. The overdue response carries data, so it i
 
 ## 4. Non-goals
 
-- image uploads and photo moderation
 - chat or messaging
-- dark mode
 - payment or deposits
 - email, SMS, or push delivery. The channel is a logged mock.
-- per-user timezones and DST-correct board dates
-- Playwright or Cypress
+- photo moderation, multiple photos per tool, and photo editing
 - live deployment
 - self-hosted Convex
 - AI features. Nothing in this brief needs a model call.
+
+### Backlog, explicitly deferred and not attempted
+
+These are recorded so the reviewer sees they were considered, not missed. Each is deliberately out of the 24-hour scope.
+
+- **Dark mode.** The design tokens are already CSS variables, so a `[data-theme="dark"]` block is the implementation. Deferred because it needs its own contrast pass across six routes and the accent palette does not carry over without retuning.
+- **Per-user timezones and DST-correct board dates.** See 7.1: a Phase 0 spike decides whether `Intl` is available in the Convex runtime. If it is, per-user timezone is implemented; if not, one board offset plus a one-day grace is the shipped behavior.
+- **Real email or SMS delivery.** The mock channel plus write-back is the tested path.
+- **Chat between borrower and lender.** The request `message` field carries the conversation.
+- **Photo moderation, multiple photos, and image editing.**
+- **Browser matrix testing beyond Chromium.**
 
 ## 5. Architecture
 
@@ -114,7 +126,7 @@ lendloop/
       api/health/route.ts
     components/
       ui/                          copied 21st.dev/shadcn-style primitives
-      tools/                       tool card, tool form, category filter
+      tools/                       tool card, tool form, photo picker, category filter
       loans/                       request dialog, loan row, activity timeline
       layout/                      nav, empty state, page header
     lib/
@@ -124,6 +136,10 @@ lendloop/
       hooks/use-current-user.ts
     middleware.ts                  Clerk middleware
     app/fonts/                     self-hosted font files
+  e2e/
+    fixtures.ts                    seeded admin, Clerk testing token
+    happy-path.spec.ts             create listing, request, approve, timeline
+    authz.spec.ts                  non-owner cannot edit or remove
   convex/
     schema.ts
     auth.config.ts                 applicationID: "convex"
@@ -135,6 +151,7 @@ lendloop/
     automation.ts                  outbox claim/dispatch, reminder claims
     admin.ts
     seed.ts                        internalMutation only
+    seed-assets/                   six CC0 demo photos plus CREDITS.md
     lib/
       auth.ts                      requireUser, requireAdmin, ownership, read scoping
       hmac.ts                      Web Crypto HMAC + constant-time compare
@@ -180,6 +197,8 @@ lendloop/
 
 **Seed adoption.** The seed creates placeholder users whose `clerkId` is `seed:<email>`. On first sign-in, `users.ensure` matches a verified Clerk email to the placeholder, replaces the Clerk id, and preserves the seeded role, tools, and loans.
 
+**Photo upload.** An authenticated owner calls `tools.generateUploadUrl`, which returns a short-lived Convex storage URL and is refused for removed tools or when the caller is at the listing cap. The browser uploads the file directly to storage. A second mutation, `tools.setPhoto`, takes the storage id, verifies the upload was created by this user in this session, checks the stored size against the 5 MB cap, deletes the previous photo, and records the new id. Replacing or removing a photo deletes the old blob. Validation limits: one photo per tool, JPEG or PNG or WebP by declared type, 5 MB, and images are served through Convex storage URLs rather than committed to the repo.
+
 ## 6. Data model
 
 All tables use explicit validators. Loan dates are stored as `YYYY-MM-DD` strings so range checks and lexicographic comparison are simple and stable. Timestamps are epoch milliseconds. Convex indexes are not unique; every "unique" key below is enforced by a read-then-insert inside one mutation, which Convex's serializable transactions make safe. Comments say "logically unique," not "unique index."
@@ -211,6 +230,7 @@ Indexes: `by_clerk_id`, `by_email`. Both are logically unique and enforced in `u
   category: "power" | "garden" | "kitchen" | "camping" | "hand_tools" | "other",
   condition: "new" | "good" | "fair" | "well_loved",
   description: string,      // 10..600 chars
+  photoStorageId?: Id<"_storage">,  // one photo, optional
   status: "active" | "removed",
   seedKey?: string,         // marks demo rows for reset
   removedAt?: number,
@@ -415,6 +435,14 @@ new Date(Date.now() + BOARD_UTC_OFFSET_MINUTES * 60_000)
 
 No `Intl`, no ICU dependency. `BOARD_UTC_OFFSET_MINUTES` defaults to `0`. The README tells the reviewer to set their local offset. DST is a documented production improvement; a fixed offset is correct for the duration of a demo. All range comparisons are string comparisons on `YYYY-MM-DD`. `daysOverdue` is computed from UTC midnight of `endDate` to UTC midnight of `boardToday`.
 
+**Timezone decision gate (Phase 0).** Before any date code is written, run one Convex query that formats `new Date()` with `Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" })` and a second with `"Pacific/Auckland"`. If both return the expected `YYYY-MM-DD` and differ from UTC, the runtime has timezone data. In that case:
+
+- Add `timezone: string` to `users`, captured from `Intl.DateTimeFormat().resolvedOptions().timeZone` at `users.ensure` and validated against a fixed list of IANA zones.
+- `boardTodayFor(user)` replaces `boardToday` for request validation, and `daysOverdue` uses the lender's zone, because the lender decides when the tool is late.
+- The one-day grace stays, now as defense against stale tabs rather than a timezone workaround.
+
+If either format call throws or ignores `timeZone`, keep the single-offset implementation above and record the measured result in the README. The spike is ten minutes and its outcome is documented either way; this is a decision the build measures, not a guess.
+
 The exact validation predicate lives in one pure function, `isValidRequestRange(startDate, endDate, boardToday)`, used by mutations and tested directly.
 
 ### 7.2 Availability
@@ -435,7 +463,9 @@ The public list shows only tools that are `available` today, because the brief a
 |---|---|---|---|
 | See public available tools (name and category only) | yes | yes | yes |
 | Browse all active tools with status and owner name | no | yes | yes |
-| View a tool's full detail | no | yes | yes |
+| View a tool's full detail, including its photo | no | yes | yes |
+| Upload or replace a photo on own listing | no | yes | yes |
+| Upload a photo to another user's listing | no | no | no |
 | Create a listing | no | yes | yes |
 | Edit own listing | no | yes | yes |
 | Edit another user's listing | no | no | no |
@@ -456,6 +486,8 @@ The public list shows only tools that are `available` today, because the brief a
 Admin removal and trusted-lender changes are audited. Viewing all loans is authorized but not audited, because it is a read.
 
 Read scoping is explicit: `loans.getDetail` and `loans.timeline` require the caller to be the borrower, the lender, or an admin. `tools.getDetail` allows any authenticated user when the tool is active, and only the owner or an admin when it is removed. Unauthorized and missing rows both return `NOT_FOUND`, so ids cannot be probed.
+
+Photo authorization follows the tool: an active tool's photo is readable by any authenticated user, a removed tool's photo only by its owner or an admin. `tools.setPhoto` is owner-only and refuses a tool the caller does not own, including admins, matching the no-edit rule. The public page never receives a storage id or a photo URL.
 
 `trustedLender` is a visual trust signal only. It grants no permission and changes no query result beyond the badge. All list queries are paginated: public and browse lists return 60 per page with a cursor and a "Load more" control, admin loans and audit lists return 50 per page or cap at 200, and a loan timeline returns at most 50 events.
 
@@ -494,7 +526,7 @@ Promotion is additive and re-evaluated on every sign-in, so changing `ADMIN_EMAI
 ## 8. Public data minimization
 
 - `tools.publicList` is unauthenticated, returns up to 60 tools plus a cursor, and projects only `{ _id, name, category }`. It filters to active tools that are `available` today.
-- It never returns owner id, owner name, description, condition, image, dates, or loan data.
+- It never returns owner id, owner name, description, condition, photo or storage id, dates, or loan data.
 - The public page has no query that accepts a user id.
 - Authenticated queries return the owner's display name and trusted badge because borrowing from a neighbor requires knowing who they are. Email addresses are never returned to other users.
 - Removed tools are absent from public and browse results.
@@ -757,7 +789,8 @@ The importer is a one-shot service with `restart: "no"`. A cold start race is pr
 - Warm, minimal, neighborhood-scale. Off-white paper background, ink text, terracotta accent, sage for success, amber for overdue.
 - One display serif for the hero and page titles, one sans for UI. Fonts are self-hosted in `src/app/fonts/` with `next/font/local`, so the Docker build does not depend on Google Fonts network access. Open-license fonts only.
 - Generous spacing, a single accent, subtle borders, no gradient soup.
-- Tokens in `globals.css` as CSS variables; light mode only.
+- Tokens in `globals.css` as CSS variables; light mode only, with the token structure keeping a future `[data-theme="dark"]` block a one-file change. Dark mode is a backlog item, not a half-built feature.
+- Every tool card and detail view has a photo slot. A tool without a photo renders a category-colored placeholder with its initial, so the layout never collapses and the seeded demo looks complete. Photos are `next/image` with explicit sizes. The public page has no photo slot.
 - Components from 21st.dev are copied into `src/components/ui`, committed with their Radix dependencies in `package.json`. The reviewer does not need registry access.
 
 ### 10.2 Routes
@@ -767,19 +800,26 @@ The importer is a one-shot service with `restart: "no"`. A cold start race is pr
 - LendLoop name and tagline.
 - Clerk sign-in button.
 - Read-only grid of available tools showing name and category only.
-- Category filter. No owner, condition, or description.
+- Category filter. No owner, condition, description, or photo. This is a brief constraint, not an oversight: the public projection is name and category.
 
 **`/browse` authenticated**
 
-- All active tools, 60 per page with a Load more control, with owner name, trusted badge, availability pill, and `nextAvailableDate`.
+- All active tools, 60 per page with a Load more control, with photo, owner name, trusted badge, availability pill, and `nextAvailableDate`.
 - Category filter.
 - Request action for any tool that is not the caller's and whose dates can be chosen without overlap.
 - The request dialog disables past dates and dates that overlap an approved loan, shows the conflict reason, and re-validates on submit. The UI never offers a range the server will reject for overlap.
+
+**`/browse/[toolId]` authenticated**
+
+- Full detail: photo, description, condition, owner, trusted badge, availability, and the loan history for that tool in date order.
+- Request action when eligible.
 
 **`/listings` authenticated**
 
 - Caller's active and removed listings.
 - New listing, edit, remove with confirmation.
+- Photo picker on create and edit: one image, client-side type and 5 MB pre-check, upload progress, preview, and remove. A failed upload leaves the listing without a photo rather than failing the whole save.
+- The form explains the limit where the reviewer will hit it: one photo, JPEG or PNG or WebP, 5 MB.
 - Removed listings are visually distinct and offer "Restore" only if restore is implemented; otherwise the README states removal is permanent from the user's perspective.
 
 **`/requests` authenticated**
@@ -840,6 +880,8 @@ Root `.env`, copied from `.env.example`. Never committed.
 | `CONVEX_SITE_URL` | n8n env | `https://<deployment>.convex.site`, set by the setup script |
 | `APP_BASE_URL` | Convex env | `http://localhost:3000` for links in payloads |
 | `ALLOW_SEED` | Convex env | second guard on the internal seed mutation |
+| `E2E_USER_EMAIL` | Playwright only | test account that must also appear in `ADMIN_EMAILS` |
+| `E2E_BASE_URL` | Playwright only | defaults to `http://localhost:3000` |
 | `N8N_ENCRYPTION_KEY` | n8n env | n8n credential encryption |
 | `POSTGRES_PASSWORD` | compose | Postgres |
 | `N8N_IMAGE` | compose | pinned n8n image |
@@ -896,7 +938,7 @@ The README opens with this path:
      `{ "email": "{{user.primary_email_address}}", "email_verified": "{{user.email_verified}}", "name": "{{user.full_name}}", "picture": "{{user.image_url}}" }`
      The standard claim is `email_verified`; Convex exposes it to `getUserIdentity()` as `emailVerified`.
 4. In `.env`, set `ADMIN_EMAILS` to the reviewer's own Clerk email and `BOARD_UTC_OFFSET_MINUTES` to their local offset (for example `-300` for US Eastern).
-5. `npm install`, `npx convex login`, `npm run setup`, `npm run seed`, open `http://localhost:3000`.
+5. `npm install`, `npx convex login`, `npm run setup`, `npm run seed`, open `http://localhost:3000`. Optionally `npm run test:e2e` to run the Playwright suite against the running compose app.
 6. Sign in with the `ADMIN_EMAILS` address. The seeded placeholder is adopted, and Incoming, My requests, and Admin are populated.
 7. If `ADMIN_EMAILS` changes after first sign-in, run `npm run seed` again. It attaches the demo rows to the existing user with that email instead of creating a second row, and the next sign-in re-evaluates admin promotion.
 
@@ -911,6 +953,7 @@ The README includes screenshots of every route and a two-minute walkthrough, so 
 - Finds a user by email. If a real user exists, it becomes the demo owner and is promoted to `admin`. If an unadopted `seed:<email>` placeholder exists, it is reused. Otherwise a placeholder with `clerkId: "seed:<email>"` and `role: "admin"` is created.
 - Upserts four fictional neighbors.
 - Upserts eight tools across power, garden, kitchen, camping, and hand tools, each with a `seedKey`.
+- Attaches a photo to six of the eight tools by reading bundled demo images from `convex/seed-assets/` into Convex storage once, keyed by `seedKey` so re-runs do not re-upload. The images are open-license (CC0) photos committed to the repo with a `CREDITS.md`, resized to 1200px wide, each under 300 KB. Two tools intentionally have no photo so the placeholder state is visible in the demo.
 - Upserts four loans tied to the admin, each with a `seedKey`, on four distinct tools with non-overlapping dates:
   1. A pending incoming request on an admin-owned tool, from a fictional borrower.
   2. An approved overdue loan on a different admin-owned tool, borrowed by a fictional user.
@@ -945,6 +988,7 @@ These are sequenced into Phase 0 and budgeted:
 | Tunnel exposes the automation editor | The tunnel targets nginx, which forwards only `/webhook/*`. The n8n editor binds to localhost. |
 | Unverified email privilege escalation | `users.ensure` requires `email_verified` and a verified claim before admin promotion or seed adoption. Clerk email verification is required in setup. |
 | Seed takeover | Seed is internal-only, gated by `ALLOW_SEED`, adopts one verified email once, and rejects a second claimant. |
+| Upload abuse through photo storage | Upload URL is issued only to an authenticated owner, never to a removed tool, and refused at the listing cap. `setPhoto` verifies the upload belongs to the caller, enforces the 5 MB cap, and deletes the replaced blob. One photo per tool bounds storage per account. Content-type is validated from the declared type and size from stored metadata; byte-level inspection is a stated production gap. |
 | Duplicate notifications | Atomic outbox claim, token-checked completion, stale-lease sweep. |
 | Duplicate reminders | Claim-then-send with a 30-minute lease and a per-day `reminderKey`. At-least-once with a dedupe key. |
 | Notification silently lost | Outbox retries with backoff, admin alerts at attempt 3, failed rows visible in the admin view, stale `sending` sweep. |
@@ -1000,6 +1044,15 @@ These are sequenced into Phase 0 and budgeted:
 6. **Seed adoption**: verified email adopts a placeholder; unverified email is rejected; a second claimant gets `ACCOUNT_CONFLICT`; admin promotion requires a verified email; demotion is audited.
 7. **Public list**: only `{ _id, name, category }`, only available tools, bounded to 60.
 8. **HTTP validation**: malformed JSON, missing fields, wrong types, invalid dates, `limit` bounds, unknown endpoint.
+9. **Photos**: `generateUploadUrl` requires auth and ownership; `setPhoto` rejects a listing the caller does not own, including admin; a storage id from another user is rejected; the size cap is enforced; replacing a photo deletes the previous blob; removed-tool photos are not returned to non-owners; the public projection never contains a storage id.
+
+**End-to-end** (`e2e/`, Playwright, Chromium only, against the compose app):
+
+- Auth uses Clerk testing tokens (`@clerk/testing` with `CLERK_SECRET_KEY` and the `ADMIN_EMAILS` test account). No test-only auth bypass exists in the app, so the E2E exercises the same middleware and JWT path as a reviewer.
+- `happy-path.spec.ts`: the admin signs in, creates a listing with a photo, requests a seeded neighbor's tool, the neighbor approves, the admin marks it returned, and the loan timeline shows delivered automation events.
+- `authz.spec.ts`: a signed-in user opens another user's listing edit URL and gets a redirect or `NOT_FOUND`, and the remove action is absent.
+- The suite is single-worker, one retry, and skips gracefully with a clear message when Clerk secrets are absent so it never blocks a reviewer without them. It runs in CI only when the Clerk secrets are configured.
+- The E2E is the reviewer's executable proof of the path, not a substitute for the unit suite. Server rules remain tested in `convex-test`.
 
 **Workflow verification** (`scripts/verify-workflows.mjs`, run in CI):
 
@@ -1038,35 +1091,42 @@ This section is deliberately short and reasoned. It answers "what would change i
 
 **Observability.** Ship structured logs to CloudWatch, traces and metrics to Datadog, and errors to Sentry with release tags. Alert on outbox depth, failed attempts, unresolved alerts, and reminder lag. Add synthetic checks on `/health` and on the webhook handshake.
 
-**Deployment shape.** Next.js on ECS or Fargate behind CloudFront and an ALB, or Vercel. API Gateway in front of HTTP actions if the app moves off Convex. S3 and CloudFront for images when they exist. WAF and rate limiting at the edge. Secrets Manager with rotation. Blue/green deploys and migrations reviewed like code.
+**Media.** One 5 MB photo per tool is correct for a demo and wrong for production. Move to S3 plus CloudFront, generate thumbnails and a 4:3 crop at upload, store the original for disputes, strip EXIF at upload, and validate the bytes against the declared type server-side. Add moderation: a queue for flagged images, takedown with an audit record, and a per-user upload rate limit. The current upload path validates ownership and size but trusts the browser's declared MIME type, which the README states as a known limitation.
+
+**Localization.** Per-user timezones land in Phase 0 if the runtime supports them, otherwise the single board offset plus one-day grace ships with the measured reason documented. Production wants the user's IANA zone, DST-correct date math, and the trade-off decided explicitly: the borrower's zone validates the request, the lender's zone decides when a loan is late.
+
+**Theming.** Dark mode is deferred, not designed out. The tokens are CSS variables in one file, so it is a `[data-theme="dark"]` block plus a contrast pass and a preference toggle persisted per user.
+
+**Deployment shape.** Next.js on ECS or Fargate behind CloudFront and an ALB, or Vercel. API Gateway in front of HTTP actions if the app moves off Convex. S3 and CloudFront for photos, with EXIF stripping at upload. WAF and rate limiting at the edge. Secrets Manager with rotation. Blue/green deploys and migrations reviewed like code.
 
 **Security.** Add edge rate limiting, bot protection, and a Content Security Policy. Rotate secrets on a schedule with the dual-secret window. Review dependency and container images. Add a threat-model review for any new PII field.
 
-**What is intentionally not here.** AI features, image uploads, chat, and payments are out of scope. Adding them would change the data model and the threat model, and the brief does not ask for them.
+**What is intentionally not here.** Chat, payments, and AI features are out of scope. Adding them would change the data model and the threat model, and the brief does not ask for them. Photos, end-to-end tests, and the timezone spike are in scope; dark mode, real delivery, multi-photo support, and moderation are in the backlog with the reason recorded.
 
 ## 16. Build order
 
-The estimates assume a clean start, the human steps in Phase 0, and a 24-hour window. The plan is 22 hours of work plus a 2-hour buffer. The n8n stack is proven before UI polish, because it is the most failure-prone phase.
+The estimates assume a clean start, the human steps in Phase 0, and a 24-hour window. Photos and end-to-end tests were added at the reviewer's request, so they consume what was previously the buffer: **24 hours of work and no slack.** If the window can extend by two hours, restore a 2-hour buffer; that is the recommended option.
 
 | Phase | Work | Estimate |
 |---|---|---|
-| 0 | Accounts, Clerk JWT template and email verification, Convex link, repo scaffold, dependencies, tokens, fonts, CI skeleton, and a one-hour n8n smoke test (compose, import a trivial workflow, activate, call it from Convex) | 3h |
-| 1 | Schema, auth and `users.ensure`, seed adoption, RBAC helpers, tools and loans mutations and queries, outbox enqueue, tests | 4.5h |
+| 0 | Accounts, Clerk JWT template and email verification, Convex link, repo scaffold, dependencies, tokens, fonts, CI skeleton, Clerk testing token, the `Intl` timezone spike, and a one-hour n8n smoke test (compose, import a trivial workflow, activate, call it from Convex) | 3.25h |
+| 1 | Schema, auth and `users.ensure`, seed adoption, RBAC helpers, tools and loans mutations and queries, photo upload mutations, outbox enqueue, tests | 5h |
 | 2 | HMAC and canonical JSON, nonce cache, HTTP endpoints with validation and body limits, outbox claim, lease, sweep, retries, tests | 3h |
-| 3 | n8n workflows: request, overdue, error; activation and verification; response signing; canonicalizer parity; end-to-end smoke | 4.5h |
-| 4 | UI routes, components, request dialog with conflict prevention, timeline, admin tabs, empty and loading states | 3h |
-| 5 | Setup script, compose, proxy, tunnel, seed reset behavior, reviewer quick start, manual end-to-end verification | 2h |
-| 6 | README, docs, screenshots, walkthrough, workflow verification, CI, final review | 2h |
-| Buffer | Unplanned framework or environment issues | 2h |
+| 3 | n8n workflows: request, overdue, error; activation and verification; response signing; canonicalizer parity; end-to-end smoke | 4.25h |
+| 4 | UI routes, components, request dialog with conflict prevention, photo picker and placeholder, timeline, admin tabs, empty and loading states | 4.5h |
+| 5 | Setup script, compose, proxy, tunnel, seed reset behavior, reviewer quick start, manual end-to-end verification | 1.5h |
+| 6 | Playwright: fixtures with Clerk testing tokens, happy path, authorization negative, local run instructions | 1.5h |
+| 7 | README, docs, screenshots, walkthrough, workflow verification, CI, final review | 1h |
 
 **Cut list, in order**, if the clock runs out:
 
-1. Admin automation tab polish. Keep the data visible; drop the styling.
-2. `nextAvailableDate` on browse. Keep the availability pill.
-3. Screenshots from every route to six representative screens.
-4. The production note's AWS detail. Keep the reasoning, shorten the mapping.
+1. `authz.spec.ts`. Keep the happy path; the authorization rule is already covered by `convex-test`.
+2. Admin automation tab polish. Keep the data visible; drop the styling.
+3. `nextAvailableDate` on browse. Keep the availability pill.
+4. Screenshots from every route to six representative screens.
+5. The production note's AWS detail. Keep the reasoning, shorten the mapping.
 
-**Never cut:** server-side RBAC, signature verification, idempotent write-backs, retries, the error workflow, the reviewer quick start, or the troubleshooting table. Those are the axes the brief grades.
+**Never cut:** server-side RBAC, signature verification, idempotent write-backs, retries, the error workflow, the reviewer quick start, or the troubleshooting table. Those are the axes the brief grades. Photo upload may degrade to the placeholder-only state if Phase 4 overruns, but the mutation and its authorization tests stay.
 
 ## 17. Builder freedom
 
@@ -1086,7 +1146,9 @@ Everything else in this document is a requirement, not a suggestion.
 **Functional**
 
 - [ ] Public page shows LendLoop, the tagline, a sign-in button, and available tools with name and category only.
-- [ ] Authenticated users can create, edit, and remove their own listings.
+- [ ] Authenticated users can create, edit, and remove their own listings, and add or replace one photo on a listing.
+- [ ] A tool without a photo renders the category placeholder rather than a broken image.
+- [ ] The public page shows no photo, owner, condition, or description.
 - [ ] Authenticated users can request a tool for a valid date range, and overlapping ranges are prevented in the UI and rejected on the server.
 - [ ] Lenders can approve or decline pending requests on their tools.
 - [ ] Lenders and borrowers can mark an approved loan returned.
@@ -1103,6 +1165,8 @@ Everything else in this document is a requirement, not a suggestion.
 - [ ] Clerk `convex` JWT template includes `email`, `email_verified`, and `name`.
 - [ ] Admin promotion and seed adoption require a verified email.
 - [ ] Seed is an internal mutation, gated by `ALLOW_SEED`.
+- [ ] Photo upload requires ownership, enforces the size cap, and is not exposed through the public projection.
+- [ ] The E2E happy path passes against the compose stack, or skips with a clear message when Clerk secrets are absent.
 - [ ] HMAC is verified on every `/n8n/*` endpoint, with method, path, timestamp, nonce, and canonical JSON.
 - [ ] Nonces are cached for the replay window.
 - [ ] The overdue response is signed and verified by n8n.
